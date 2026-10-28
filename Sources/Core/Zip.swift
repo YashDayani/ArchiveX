@@ -55,7 +55,7 @@ final class ZipArchive {
     private(set) var comment = Data()
 
     init(url: URL) throws {
-        file = try FileIn(url)
+        file = try FileIn.openArchive(url)
         try parse()
     }
 
@@ -171,7 +171,7 @@ final class ZipArchive {
 
     /// Streams the (decrypted, decompressed) contents of `e` into `sink`, verifying CRC and size.
     func read(_ e: ZipEntry, password: String?, progress: ProgressTracker?, into sink: ByteSink) throws {
-        guard e.realMethod == 0 || e.realMethod == 8 else {
+        guard [0, 8, 9, 12, 14].contains(e.realMethod) else {
             throw AXError.unsupported("ZIP compression method \(e.realMethod)")
         }
         if e.csize == 0 && e.usize == 0 { return }
@@ -182,7 +182,8 @@ final class ZipArchive {
 
         var crc: UInt32 = 0
         var produced: UInt64 = 0
-        let inflater: Inflater? = e.realMethod == 8 ? Inflater() : nil
+        let inflater: Inflater? = e.realMethod == 8 || e.realMethod == 9 ? Inflater(deflate64: e.realMethod == 9) : nil
+        let pulled = e.realMethod == 12 || e.realMethod == 14        // bzip2 and LZMA are pulled through a decoder
         var finished = false
 
         func emit(_ d: Data) throws {
@@ -232,12 +233,35 @@ final class ZipArchive {
             }
         }
 
-        while remaining > tailBytes {
+        func nextPacked() throws -> Data {
+            guard remaining > tailBytes else { return Data() }
             let n = Int(min(UInt64(chunk), remaining - tailBytes))
             var d = try pull(n)
             if let mac = aesMac, let c = aesCipher { mac.update(d); d = try c.apply(d) }
             else if zc != nil { d = zc!.decrypt(d) }
-            try feed(d, last: remaining == tailBytes)
+            return d
+        }
+        if pulled {
+            let packed = ClosureSource(nextPacked)
+            let decoder: ByteSource
+            if e.realMethod == 12 { decoder = try Bzip2Source(source: packed) }
+            else {
+                let head = try packed.readExactly(4)
+                let psize = Int(head[head.startIndex + 2]) | Int(head[head.startIndex + 3]) << 8
+                guard psize >= 5, psize <= 64 else { throw AXError.corrupt("bad LZMA properties in “\(e.name)”") }
+                let props = try packed.readExactly(psize)
+                decoder = try LzmaSource(input: packed, props: props, unpackSize: e.usize)
+            }
+            while produced < e.usize {
+                let d = try decoder.read(Int(min(UInt64(chunk), e.usize - produced)))
+                if d.isEmpty { throw AXError.corrupt("“\(e.name)” ended unexpectedly") }
+                try emit(d)
+            }
+            while !(try packed.read(1 << 16)).isEmpty { }          // let the packed tail (and AES tag) through
+        } else {
+            while remaining > tailBytes {
+                try feed(try nextPacked(), last: remaining == tailBytes)
+            }
         }
         if let mac = aesMac {
             let tag = try pull(10)
@@ -521,4 +545,21 @@ final class ZipWriter {
         e.put32(UInt32(min(cdSize, 0xffff_ffff))); e.put32(UInt32(min(cdStart, 0xffff_ffff))); e.put16(0)
         try out.write(e)
     }
+}
+
+
+/// A byte source fed by a closure that returns the next chunk (empty at the end).
+final class ClosureSource: ByteSource {
+    private let next: () throws -> Data
+    private var buf = Data()
+    init(_ next: @escaping () throws -> Data) { self.next = next }
+    func read(_ n: Int) throws -> Data {
+        if buf.isEmpty { buf = try next() }
+        guard !buf.isEmpty else { return Data() }
+        let take = min(n, buf.count)
+        let d = buf.subdata(in: buf.startIndex..<buf.startIndex + take)
+        buf = buf.subdata(in: buf.startIndex + take..<buf.endIndex)
+        return d
+    }
+    func skip(_ n: UInt64) throws { try discard(n) }
 }

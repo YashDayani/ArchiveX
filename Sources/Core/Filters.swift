@@ -182,3 +182,75 @@ final class FilterSink: ByteSink {
         raw.removeAll()
     }
 }
+
+// MARK: - BCJ2 (7z coder 0303011B)
+
+/// x86 branch converter with four input streams: the main bytes, the absolute CALL targets, the absolute JMP targets
+/// and a range-coded stream of "was this branch converted" flags.
+final class Bcj2Source: ByteSource {
+    private final class Reader {
+        let src: ByteSource
+        var buf = [UInt8](); var pos = 0
+        init(_ s: ByteSource) { src = s }
+        @inline(__always) func next() throws -> UInt8? {
+            if pos == buf.count {
+                let d = try src.read(1 << 16)
+                if d.isEmpty { return nil }
+                buf = [UInt8](d); pos = 0
+            }
+            defer { pos += 1 }
+            return buf[pos]
+        }
+    }
+    private let main: Reader, call: Reader, jump: Reader, rc: Reader
+    private var probs = [UInt32](repeating: 1 << 10, count: 258)
+    private var range: UInt32 = 0xffff_ffff
+    private var code: UInt32 = 0
+    private var prev: UInt8 = 0
+    private var outPos: UInt64 = 0
+    private let outSize: UInt64
+    private var pending = [UInt8]()            // converted address bytes not yet returned
+    private var started = false
+
+    init(main: ByteSource, call: ByteSource, jump: ByteSource, rc: ByteSource, outSize: UInt64) {
+        self.main = Reader(main); self.call = Reader(call); self.jump = Reader(jump); self.rc = Reader(rc); self.outSize = outSize
+    }
+
+    private func rcByte() throws -> UInt32 {
+        guard let b = try rc.next() else { throw AXError.corrupt("truncated BCJ2 data") }
+        return UInt32(b)
+    }
+
+    func read(_ n: Int) throws -> Data {
+        if !started {
+            started = true
+            for _ in 0..<5 { code = code << 8 | (try rcByte()) }
+        }
+        var out = [UInt8]()
+        out.reserveCapacity(min(n, 1 << 16))
+        while out.count < n, outPos < outSize {
+            if !pending.isEmpty { out.append(pending.removeFirst()); outPos += 1; continue }
+            guard let b = try main.next() else { throw AXError.corrupt("truncated BCJ2 data") }
+            out.append(b); outPos += 1
+            let isJcc = prev == 0x0f && (b & 0xf0) == 0x80
+            if !((b & 0xfe) == 0xe8 || isJcc) { prev = b; continue }
+            if outPos == outSize { break }
+            let pi = b == 0xe8 ? Int(prev) : (b == 0xe9 ? 256 : 257)
+            let ttt = probs[pi]
+            let bound = (range >> 11) * ttt
+            var bit: Bool
+            if code < bound { range = bound; probs[pi] = ttt + ((2048 - ttt) >> 5); bit = false }
+            else { range -= bound; code -= bound; probs[pi] = ttt - (ttt >> 5); bit = true }
+            if range < (1 << 24) { range <<= 8; code = code << 8 | (try rcByte()) }
+            if !bit { prev = b; continue }
+            let src = b == 0xe8 ? call : jump
+            var v: UInt32 = 0
+            for _ in 0..<4 { guard let x = try src.next() else { throw AXError.corrupt("truncated BCJ2 data") }; v = v << 8 | UInt32(x) }
+            let dest = v &- UInt32(truncatingIfNeeded: outPos + 4)
+            pending = [UInt8(truncatingIfNeeded: dest), UInt8(truncatingIfNeeded: dest >> 8), UInt8(truncatingIfNeeded: dest >> 16), UInt8(truncatingIfNeeded: dest >> 24)]
+            prev = pending[3]
+        }
+        return Data(out)
+    }
+    func skip(_ n: UInt64) throws { try discard(n) }
+}

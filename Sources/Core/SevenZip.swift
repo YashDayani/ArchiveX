@@ -15,12 +15,12 @@ private enum ID {
 private enum Method {
     static let copy: UInt64 = 0x00, delta: UInt64 = 0x03, bcjx86: UInt64 = 0x04, arm64: UInt64 = 0x0a
     static let lzma2: UInt64 = 0x21, lzma: UInt64 = 0x030101, ppmd: UInt64 = 0x030401
-    static let bcjx86Old: UInt64 = 0x03030103, armOld: UInt64 = 0x03030501
+    static let bcj2: UInt64 = 0x0303011b, bcjx86Old: UInt64 = 0x03030103, armOld: UInt64 = 0x03030501
     static let deflate: UInt64 = 0x040108, bzip2: UInt64 = 0x040202, aes: UInt64 = 0x06f10701
 
     static func name(_ id: UInt64) -> String {
         switch id {
-        case copy: return "Store"; case delta: return "Delta"; case bcjx86, bcjx86Old: return "BCJ"; case arm64: return "ARM64"
+        case copy: return "Store"; case bcj2: return "BCJ2"; case delta: return "Delta"; case bcjx86, bcjx86Old: return "BCJ"; case arm64: return "ARM64"
         case armOld: return "ARM"; case lzma2: return "LZMA2"; case lzma: return "LZMA"; case ppmd: return "PPMd"
         case deflate: return "Deflate"; case bzip2: return "BZip2"; case aes: return "AES-256"
         default: return "method " + String(id, radix: 16)
@@ -296,7 +296,7 @@ final class SevenZipArchive {
     var folders: [SZFolder] { streams.folders }
 
     init(url: URL, password: String?) throws {
-        file = try FileIn(url)
+        file = try FileIn.openArchive(url)
         self.password = password
         try parse()
     }
@@ -534,19 +534,24 @@ final class SevenZipArchive {
         var ai = 0, ao = 0
         for c in f.coders { inBase.append(ai); outBase.append(ao); ai += c.numIn; ao += c.numOut }
 
+        func inputFor(_ inStream: Int) throws -> ByteSource {
+            if let bp = f.bind.first(where: { $0.inIdx == inStream }) { return try build(out: bp.outIdx) }
+            guard let pi = f.packed.firstIndex(of: inStream), f.firstPack + pi < info.packSizes.count else { throw AXError.corrupt("bad 7z pack stream") }
+            let idx = f.firstPack + pi
+            guard packOffset(info, idx) + info.packSizes[idx] <= file.size else { throw AXError.corrupt("7z data out of range (truncated archive?)") }
+            return RangeSource(file: file, offset: packOffset(info, idx), length: info.packSizes[idx])
+        }
+
         func build(out: Int) throws -> ByteSource {
             guard let ci = (0..<f.coders.count).last(where: { outBase[$0] <= out }) else { throw AXError.corrupt("bad 7z folder graph") }
             let c = f.coders[ci]
-            guard c.numIn == 1, c.numOut == 1 else { throw AXError.unsupported("7z method \(Method.name(c.id)) (multi-stream)") }
-            let inStream = inBase[ci]
-            let input: ByteSource
-            if let bp = f.bind.first(where: { $0.inIdx == inStream }) { input = try build(out: bp.outIdx) }
-            else {
-                guard let pi = f.packed.firstIndex(of: inStream), f.firstPack + pi < info.packSizes.count else { throw AXError.corrupt("bad 7z pack stream") }
-                let idx = f.firstPack + pi
-                guard packOffset(info, idx) + info.packSizes[idx] <= file.size else { throw AXError.corrupt("7z data out of range (truncated archive?)") }
-                input = RangeSource(file: file, offset: packOffset(info, idx), length: info.packSizes[idx])
+            if c.id == Method.bcj2 {
+                guard c.numIn == 4, c.numOut == 1 else { throw AXError.corrupt("bad BCJ2 coder") }
+                return Bcj2Source(main: try inputFor(inBase[ci]), call: try inputFor(inBase[ci] + 1), jump: try inputFor(inBase[ci] + 2),
+                                  rc: try inputFor(inBase[ci] + 3), outSize: f.unpack[out])
             }
+            guard c.numIn == 1, c.numOut == 1 else { throw AXError.unsupported("7z method \(Method.name(c.id)) (multi-stream)") }
+            let input = try inputFor(inBase[ci])
             let size = f.unpack[out]
             switch c.id {
             case Method.copy: return input

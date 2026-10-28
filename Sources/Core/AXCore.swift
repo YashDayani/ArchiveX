@@ -39,7 +39,11 @@ enum AXCore {
     // MARK: - format detection
 
     static func kind(of url: URL) -> AXKind? {
-        let n = url.lastPathComponent.lowercased()
+        var n = url.lastPathComponent.lowercased()
+        if n.count > 4, let dot = n.lastIndex(of: "."), n.distance(from: dot, to: n.endIndex) == 4,
+           n[n.index(after: dot)...].allSatisfy({ $0.isASCII && $0.isNumber }), n[..<dot].hasSuffix(".7z") || n[..<dot].hasSuffix(".zip") {
+            n = String(n[..<dot])                                           // split archive: name.7z.001, name.zip.002, …
+        }
         if n.hasSuffix(".tar.gz") || n.hasSuffix(".tgz") || n.hasSuffix(".taz") { return .tgz }
         if n.hasSuffix(".tar.bz2") || n.hasSuffix(".tbz2") || n.hasSuffix(".tbz") || n.hasSuffix(".tb2") { return .tbz2 }
         if n.hasSuffix(".bz2") { return .bz2 }

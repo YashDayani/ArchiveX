@@ -189,6 +189,33 @@ do {
     sh("\(SZ) a -bso0 -tzip \(q(foreign.appendingPathComponent("many.zip"))) .", cwd: many)
     let ml = try AXCore.list(foreign.appendingPathComponent("many.zip"), password: nil)
     check("read ZIP with 70 000 entries (ZIP64 directory)", ml.entries.filter { !$0.isDir }.count == 70000, "\(ml.entries.count)")
+
+    // other ZIP compression methods written by 7-Zip: Deflate64, bzip2, LZMA (also with AES), and a split set
+    let zm = work.appendingPathComponent("zipmethods"); try fm.createDirectory(at: zm, withIntermediateDirectories: true)
+    let zbig = work.appendingPathComponent("zipbig"); try fm.createDirectory(at: zbig, withIntermediateDirectories: true)
+    try Data((1...200_000).map { "row \($0): alpha beta gamma delta \($0 % 97)\n" }.joined().utf8).write(to: zbig.appendingPathComponent("big.txt"))
+    try Data((0..<(600 << 10)).map { _ in UInt8.random(in: 0...255) }).write(to: zbig.appendingPathComponent("noise.bin"))
+    for (label, args) in [("Deflate64", "-mm=Deflate64"), ("BZip2", "-mm=BZip2"), ("LZMA", "-mm=LZMA"), ("LZMA + AES", "-mm=LZMA -mem=AES256 -ppw456"),
+                          ("Deflate64 + AES", "-mm=Deflate64 -mem=AES256 -ppw456"), ("BZip2 + ZipCrypto", "-mm=BZip2 -mem=ZipCrypto -ppw456")] {
+        let id = label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: "+", with: "p")
+        let a = zm.appendingPathComponent("\(id).zip")
+        sh("\(SZ) a -bso0 -tzip \(args) \(q(a)) big.txt noise.bin", cwd: zbig)
+        let ref = work.appendingPathComponent("refz-\(id)")
+        let pw: String? = label.contains("+") ? "pw456" : nil
+        sh("\(SZ) x -y \(pw.map { "-p\($0)" } ?? "") -o\(q(ref)) \(q(a))")
+        do {
+            let ours = try extractOurs(a, to: "ownz-\(id)", password: pw)
+            check("zip [\(label)]: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+            try AXCore.test(a, password: pw, progress: { _ in })
+        } catch { check("zip [\(label)]", false, "\(error)") }
+    }
+    let zsplit = work.appendingPathComponent("zipsplit"); try fm.createDirectory(at: zsplit, withIntermediateDirectories: true)
+    sh("\(SZ) a -bso0 -tzip -v200k \(q(zsplit.appendingPathComponent("s.zip"))) big.txt noise.bin", cwd: zbig)
+    do {
+        let ref = work.appendingPathComponent("refz-split"); sh("\(SZ) x -y -o\(q(ref)) \(q(zsplit.appendingPathComponent("s.zip.001")))")
+        let ours = try extractOurs(zsplit.appendingPathComponent("s.zip.001"), to: "ownz-split")
+        check("zip split (.zip.001 …): matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+    } catch { check("zip split", false, "\(error)") }
 } catch { check("section 2 threw", false, "\(error)") }
 
 // MARK: 3. editing
@@ -546,6 +573,41 @@ do {
             try AXCore.test(a, password: pw ? aesPW : nil, progress: { _ in })
         } catch { check("7z PPMd [\(label)]", false, "\(error)") }
     }
+    // BCJ2 (four-stream x86 filter) on real x86-64 code, and a split archive (name.7z.001, …)
+    let xdir = work.appendingPathComponent("x86dir"); try fm.createDirectory(at: xdir, withIntermediateDirectories: true)
+    var haveX86 = false
+    for bin in ["/usr/bin/ssh", "/usr/bin/curl", "/usr/bin/git"] where fm.fileExists(atPath: bin) {
+        if sh("/usr/bin/lipo -thin x86_64 \(bin) -output \(q(xdir.appendingPathComponent((bin as NSString).lastPathComponent + ".x86")))").status == 0 { haveX86 = true }
+    }
+    if haveX86 {
+        for (label, args) in [("BCJ2", "-mf=BCJ2"), ("BCJ2 non-solid", "-mf=BCJ2 -ms=off"), ("BCJ2 + AES", "-mf=BCJ2 \(aesPWArg)")] {
+            let id = label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: "+", with: "p")
+            let a = foreign7.appendingPathComponent("b2-\(id).7z")
+            sh("\(SZ) a -bso0 -t7z \(args) \(q(a)) .", cwd: xdir)
+            let info = sh("\(SZ) l -slt \(q(a)) | grep -i '^Method' | head -1").out
+            let pw = label.contains("AES")
+            let ref = ref7z(a, "b2-\(id)", pw: pw)
+            do {
+                let ours = try extractOurs(a, to: "x7b2-\(id)", password: pw ? aesPW : nil)
+                check("7z BCJ2 [\(label)]: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+                try AXCore.test(a, password: pw ? aesPW : nil, progress: { _ in })
+            } catch { check("7z BCJ2 [\(label)]", false, "\(error)") }
+            if label == "BCJ2" { check("7z BCJ2: archive really uses BCJ2", info.contains("BCJ2"), info) }
+        }
+    }
+    let splitDir = work.appendingPathComponent("split7"); try fm.createDirectory(at: splitDir, withIntermediateDirectories: true)
+    sh("\(SZ) a -bso0 -t7z -v300k -mx=3 \(q(splitDir.appendingPathComponent("s.7z"))) big.txt noise.bin curl.bin", cwd: pbig)
+    let splitFirst = splitDir.appendingPathComponent("s.7z.001")
+    check("7z split: volumes were created", fm.fileExists(atPath: splitDir.appendingPathComponent("s.7z.003").path))
+    do {
+        let ref = ref7z(splitFirst, "split7")
+        for opened in ["s.7z.001", "s.7z.002"] {
+            let ours = try extractOurs(splitDir.appendingPathComponent(opened), to: "x7split-\(opened)")
+            check("7z split [open \(opened)]: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+        }
+        try AXCore.test(splitFirst, password: nil, progress: { _ in })
+    } catch { check("7z split", false, "\(error)") }
+
     let ppmd = foreign7.appendingPathComponent("p-default.7z")
     let ppmdInfo = sh("\(SZ) l -slt \(q(ppmd)) | grep -i '^Method' | head -1").out
     check("7z PPMd: archive really uses PPMd", ppmdInfo.lowercased().contains("ppmd"), ppmdInfo)
