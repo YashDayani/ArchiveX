@@ -286,6 +286,19 @@ do {
     check("existing symlink: nothing is written outside the destination", outsideFiles.isEmpty, "\(outsideFiles)")
     check("existing symlink: permissions and dates outside are not touched", outsideMode == 0o700 && (outsideDate ?? Date()).timeIntervalSince1970 > 1_100_000_000, "\(String(describing: outsideMode)) \(String(describing: outsideDate))")
 
+    // (d) ordering attack: a link through a folder that does not exist yet, which a later entry turns into a symlink
+    let outerD = work.appendingPathComponent("atk-d"); try fm.createDirectory(at: outerD, withIntermediateDirectories: true)
+    let zd = work.appendingPathComponent("atk-d.zip")
+    let wd = try ZipWriter(url: zd, password: nil, level: 0)
+    try wd.addSymlink(name: "y", target: "a/b/nope/..", mtime: Date())          // looks like a/b, inside
+    try wd.addSymlink(name: "a/b/nope", target: "../..", mtime: Date())          // later: nope -> the destination root
+    try wd.finish()
+    let innerD = outerD.appendingPathComponent("inner")
+    _ = try AXCore.extract(zd, selection: [], to: innerD, overwrite: .all, keepPaths: true, password: nil, progress: { _ in })
+    let yReal = URL(fileURLWithPath: innerD.appendingPathComponent("y").path).resolvingSymlinksInPath().path
+    let yExists = (try? fm.destinationOfSymbolicLink(atPath: innerD.appendingPathComponent("y").path)) != nil
+    check("symlink ordering: a link that a later entry redirects above the folder does not survive", !yExists || (yReal.hasPrefix(innerD.resolvingSymlinksInPath().path)), "y -> \(yReal)")
+
     // (c) tar flavour: a symlink entry followed by a file written "through" it
     let tarSrc = work.appendingPathComponent("atk-tar-src"); try fm.createDirectory(at: tarSrc, withIntermediateDirectories: true)
     try fm.createSymbolicLink(atPath: tarSrc.appendingPathComponent("esc").path, withDestinationPath: "../")

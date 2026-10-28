@@ -194,6 +194,7 @@ final class Extractor {
     let keepPaths: Bool
     let selection: [(path: String, isDir: Bool)]
     private(set) var skippedUnsafe: [String] = []
+    private var createdLinks: [URL] = []
     private(set) var extracted = 0
 
     init(destination: URL, overwrite: Overwrite, keepPaths: Bool, selection: [(path: String, isDir: Bool)]) throws {
@@ -304,7 +305,14 @@ final class Extractor {
             }
             let next = cur + "/" + c
             var st = stat()
-            if lstat(next, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK {
+            if lstat(next, &st) != 0 {
+                // A component that doesn't exist yet could later become a symlink, which would change what a
+                // following ".." means. Don't guess: refuse such targets.
+                if pending.contains("..") { return false }
+                cur = next
+                continue
+            }
+            if (st.st_mode & S_IFMT) == S_IFLNK {
                 hops += 1
                 guard hops <= 40, let t = try? FileManager.default.destinationOfSymbolicLink(atPath: next), !t.hasPrefix("/") else { return false }
                 pending.append(contentsOf: t.split(separator: "/").map(String.init).reversed())
@@ -320,7 +328,21 @@ final class Extractor {
         guard !target.hasPrefix("/") else { skippedUnsafe.append(url.lastPathComponent + " → " + target); return }
         let dir = url.deletingLastPathComponent().resolvingSymlinksInPath().path
         guard inside(dir), staysInside(target, from: dir) else { skippedUnsafe.append(url.lastPathComponent + " → " + target); return }
-        try? FileManager.default.createSymbolicLink(atPath: url.path, withDestinationPath: target)
+        if (try? FileManager.default.createSymbolicLink(atPath: url.path, withDestinationPath: target)) != nil || FileManager.default.fileExists(atPath: url.path) {
+            createdLinks.append(url)
+            if !inside(url.resolvingSymlinksInPath().path) {                      // belt and braces: check the result too
+                try? FileManager.default.removeItem(at: url); createdLinks.removeLast()
+                skippedUnsafe.append(url.lastPathComponent + " → " + target)
+            }
+        }
+    }
+
+    /// Final sweep: entries extracted later may have changed what an earlier symlink resolves to.
+    func verifyLinks() {
+        for u in createdLinks where !inside(u.resolvingSymlinksInPath().path) {
+            try? FileManager.default.removeItem(at: u)
+            skippedUnsafe.append(u.lastPathComponent + " (link would leave the destination)")
+        }
     }
 }
 

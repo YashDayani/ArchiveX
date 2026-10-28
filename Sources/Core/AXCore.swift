@@ -224,6 +224,7 @@ enum AXCore {
                 } catch { try? FileManager.default.removeItem(at: u); throw error }
             }
         }
+        ex.verifyLinks()
         return ex.skippedUnsafe
     }
 
