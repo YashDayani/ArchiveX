@@ -657,6 +657,131 @@ if CommandLine.arguments.count > 3 {
     } catch { check("section 10 threw", false, "\(error)") }
 }
 
+// MARK: 10b. RAR 3/4 format (the older RAR format: -ma4)
+// RAR 7 can no longer create RAR 4 archives, so this section needs a fourth argument: a folder with a `rar` from the
+// 5.x/6.x line (for example 5.91). The newer `unrar` from the third argument is still the reference extractor.
+
+if CommandLine.arguments.count > 4 {
+    let RARDIR = CommandLine.arguments[3]
+    let rarPW = "\"$(printf 's3cret-\\xc3\\xa9')\""
+    let RAR = CommandLine.arguments[4] + "/rar", UNRAR = RARDIR + "/unrar"
+    do {
+        let rdir = work.appendingPathComponent("rar4"); try fm.createDirectory(at: rdir, withIntermediateDirectories: true)
+        let big = work.appendingPathComponent("rar4big"); try fm.createDirectory(at: big, withIntermediateDirectories: true)
+        try Data((1...400_000).map { "line \($0): alpha beta gamma delta epsilon \($0 % 211)\n" }.joined().utf8).write(to: big.appendingPathComponent("big.txt"))
+        try Data((0..<(2 << 20)).map { _ in UInt8.random(in: 0...255) }).write(to: big.appendingPathComponent("noise.bin"))
+        var x86 = Data([0x4d, 0x5a, 0x90, 0x00])
+        for i in 0..<300_000 { x86.append(contentsOf: [0x55, 0x8b, 0xec, 0xe8, UInt8(i & 0xff), UInt8((i >> 8) & 0xff), 0x00, i % 5 == 0 ? 0xff : 0x00, 0xe9, UInt8((i * 7) & 0xff), 0x01, 0x00, 0x00, 0xc3]) }
+        try x86.write(to: big.appendingPathComponent("code.exe"))
+        var wav = Data(); for i in 0..<400_000 { let v = Int16(truncatingIfNeeded: Int(sin(Double(i) / 20) * 9000)); wav.append(UInt8(truncatingIfNeeded: v)); wav.append(UInt8(truncatingIfNeeded: v >> 8)) }
+        try wav.write(to: big.appendingPathComponent("tone.wav"))
+        // a 24-bit bitmap with gradients and noise (RGB filter)
+        var bmp = Data([0x42, 0x4d]); let bw = 300, bh = 200
+        var pix = Data()
+        for y in 0..<bh { for x in 0..<bw { pix.append(contentsOf: [UInt8((x * 255 / bw + Int.random(in: 0...6)) & 255), UInt8((y * 255 / bh + Int.random(in: 0...6)) & 255), UInt8(((x + y) * 255 / (bw + bh) + Int.random(in: 0...6)) & 255)]) } }
+        func le32(_ v: Int) -> [UInt8] { [UInt8(v & 255), UInt8((v >> 8) & 255), UInt8((v >> 16) & 255), UInt8((v >> 24) & 255)] }
+        bmp.append(contentsOf: le32(54 + pix.count) + [0, 0, 0, 0] + le32(54) + le32(40) + le32(bw) + le32(bh) + [1, 0, 24, 0] + le32(0) + le32(pix.count) + le32(2835) + le32(2835) + le32(0) + le32(0))
+        bmp.append(pix)
+        try bmp.write(to: big.appendingPathComponent("pic.bmp"))
+
+        func rar4(_ name: String, _ opts: String, items: String, cwd: URL) -> URL {
+            let a = rdir.appendingPathComponent(name); try? fm.removeItem(at: a)
+            let r = sh("\(RAR) a -inul -ma4 -ep1 \(opts) \(q(a)) \(items)", cwd: cwd)
+            if r.status != 0 { print("   (rar failed: \(r.out.suffix(120)))") }
+            return a
+        }
+        func check4(_ label: String, _ a: URL, pw: String? = nil, openAs: URL? = nil) {
+            let id = label.replacingOccurrences(of: " ", with: "_")
+            let refDir = work.appendingPathComponent("r4ref-\(id)")
+            try? fm.createDirectory(at: refDir, withIntermediateDirectories: true)
+            let pwArg = pw != nil ? "-p\(rarPW)" : "-p-"
+            sh("\(UNRAR) x -y -o+ \(pwArg) \(q(a)) \(q(refDir))/")
+            let target = openAs ?? a
+            do {
+                let ours = try extractOurs(target, to: "r4own-\(id)", password: pw)
+                check("rar4 [\(label)]: matches unrar's extraction", sameTree(refDir, ours) == nil, sameTree(refDir, ours) ?? "")
+                try AXCore.test(target, password: pw, progress: { _ in })
+                check("rar4 [\(label)]: integrity test passes", true)
+            } catch { check("rar4 [\(label)]", false, "\(error)") }
+        }
+
+        let tree = "a.txt sub empty-dir empty.txt run.sh 'résumé 日本語 ✓.txt' '\(longDir)'"
+        for (label, opts) in [("store", "-m0"), ("m1", "-m1"), ("m2", "-m2"), ("m3", "-m3"), ("m4", "-m4"), ("m5", "-m5"), ("solid m3", "-m3 -s"), ("dict 64k", "-md64k"), ("dict 4m", "-md4m -m5"),
+                              ("with recovery record", "-rr3"), ("-ol symlinks", "-ol")] {
+            check4(label, rar4("t-\(label.replacingOccurrences(of: " ", with: "_")).rar", opts, items: tree, cwd: src))
+        }
+        for (label, opts) in [("big mixed m3", "-m3"), ("big mixed m5 solid", "-m5 -s"), ("big mixed m1", "-m1"), ("big mixed store", "-m0"),
+                              ("text PPMd", "-m3 -mct+"), ("text PPMd order 2", "-m3 -mc2:16t+"), ("text PPMd order 63", "-m5 -mc63:128t+"),
+                              ("text PPMd 1 MB (model restarts)", "-m3 -mc6:1t+"), ("PPMd solid", "-m3 -s -mct+"), ("PPMd and LZ mixed, solid", "-m5 -s -mct")] {
+            check4(label, rar4("b-\(label.replacingOccurrences(of: " ", with: "_")).rar", opts, items: "big.txt noise.bin code.exe tone.wav", cwd: big))
+        }
+        // the six standard filters
+        check4("filter: audio", rar4("f-audio.rar", "-m5 -mc2a+", items: "tone.wav", cwd: big))
+        check4("filter: delta", rar4("f-delta.rar", "-m3 -mc4d+", items: "tone.wav", cwd: big))
+        check4("filter: RGB", rar4("f-rgb.rar", "-m3 -mcc+", items: "pic.bmp", cwd: big))
+        check4("filter: x86 E8/E9", rar4("f-e8.rar", "-m3 -mce+", items: "code.exe", cwd: big))
+        check4("filter: Itanium", rar4("f-itanium.rar", "-m3 -mci+", items: "code.exe", cwd: big))
+        check4("filters, solid", rar4("f-all.rar", "-s -m5 -mcc+ -mca+ -mce+", items: "pic.bmp tone.wav code.exe", cwd: big))
+        for bin in ["/usr/bin/ssh", "/usr/bin/curl"] where fm.fileExists(atPath: bin) {
+            let thin = big.appendingPathComponent((bin as NSString).lastPathComponent + ".x86")
+            if sh("/usr/bin/lipo -thin x86_64 \(bin) -output \(q(thin))").status == 0 {
+                check4("x86-64 code \((bin as NSString).lastPathComponent)", rar4("x86-\((bin as NSString).lastPathComponent).rar", "-m5", items: q(thin), cwd: big))
+            }
+        }
+        // passwords (AES-128 with SHA-1 key derivation)
+        check4("password", rar4("pw.rar", "-m3 -p\(rarPW)", items: tree, cwd: src), pw: aesPW)
+        check4("password + encrypted headers", rar4("hp.rar", "-m3 -hp\(rarPW)", items: tree, cwd: src), pw: aesPW)
+        check4("password, store", rar4("pw0.rar", "-m0 -p\(rarPW)", items: "a.txt sub", cwd: src), pw: aesPW)
+        check4("password, big solid PPMd", rar4("pwb.rar", "-m3 -s -mct+ -p\(rarPW)", items: "big.txt noise.bin", cwd: big), pw: aesPW)
+        for name in ["pw.rar", "hp.rar"] {
+            do { _ = try AXCore.list(rdir.appendingPathComponent(name), password: nil); _ = try extractOurs(rdir.appendingPathComponent(name), to: "r4pw-none-\(name)"); check("rar4 \(name): missing password reported", false) }
+            catch AXError.passwordRequired { check("rar4 \(name): missing password reported", true) } catch { check("rar4 \(name): missing password reported", false, "\(error)") }
+            do { _ = try extractOurs(rdir.appendingPathComponent(name), to: "r4pw-bad-\(name)", password: "wrong"); check("rar4 \(name): wrong password rejected", false) }
+            catch AXError.wrongPassword { check("rar4 \(name): wrong password rejected", true) } catch { check("rar4 \(name): wrong password rejected", false, "\(error)") }
+        }
+        // multi-volume sets: new (.partNN.rar) and old (.rar, .r00, …) numbering
+        let vdir = rdir.appendingPathComponent("vol"); try fm.createDirectory(at: vdir, withIntermediateDirectories: true)
+        let vnew = vdir.appendingPathComponent("new.part01.rar")
+        sh("\(RAR) a -inul -ma4 -ep1 -m3 -v600k \(q(vdir.appendingPathComponent("new.rar"))) big.txt noise.bin code.exe", cwd: big)
+        check("rar4 volumes: the set was created", fm.fileExists(atPath: vdir.appendingPathComponent("new.part3.rar").path) || fm.fileExists(atPath: vdir.appendingPathComponent("new.part03.rar").path) || fm.fileExists(atPath: vnew.path))
+        if let first = (try? fm.contentsOfDirectory(atPath: vdir.path))?.filter({ $0.hasPrefix("new.part") }).sorted().first {
+            let f1 = vdir.appendingPathComponent(first)
+            check4("multi-volume (new numbering), open first volume", f1)
+            let parts = (try? fm.contentsOfDirectory(atPath: vdir.path))?.filter { $0.hasPrefix("new.part") }.sorted() ?? []
+            if parts.count > 1 { check4("multi-volume, open a later volume", f1, openAs: vdir.appendingPathComponent(parts[1])) }
+            if parts.count > 2 {
+                // a missing volume must be reported, not silently produce a short file
+                let gone = vdir.appendingPathComponent(parts[2]); let kept = try Data(contentsOf: gone)
+                try fm.removeItem(at: gone)
+                var failed = false; do { try AXCore.test(f1, password: nil, progress: { _ in }) } catch { failed = true }
+                check("rar4 volumes: a missing volume is reported", failed)
+                try kept.write(to: gone)
+            }
+        }
+        let odir = rdir.appendingPathComponent("oldvol"); try fm.createDirectory(at: odir, withIntermediateDirectories: true)
+        sh("\(RAR) a -inul -ma4 -ep1 -m3 -v500k -vn \(q(odir.appendingPathComponent("old.rar"))) big.txt code.exe", cwd: big)
+        check4("multi-volume (old numbering: .rar, .r00 …)", odir.appendingPathComponent("old.rar"))
+        // solid: pulling one file from the middle must still decode the files before it
+        let solidA = rdir.appendingPathComponent("b-big_mixed_m5_solid.rar")
+        let selDir = work.appendingPathComponent("rar4-sel")
+        try AXCore.extract(solidA, selection: [("tone.wav", false)], to: selDir, overwrite: .all, keepPaths: true, password: nil, progress: { _ in })
+        check("rar4 solid: extracting one file from the middle works", (try? Data(contentsOf: selDir.appendingPathComponent("tone.wav"))) == wav)
+        let l = try AXCore.list(rdir.appendingPathComponent("t-m3.rar"), password: nil)
+        check("rar4 listing: names, sizes and folders", l.entries.contains { $0.path == "sub/b.txt" && $0.size == 6 } && l.entries.contains { $0.isDir && $0.path == "empty-dir" } && l.entries.contains { $0.path == "résumé 日本語 ✓.txt" } && l.details.hasPrefix("RAR 4"), "\(l.details) \(l.entries.map(\.path).prefix(6))")
+        // corruption / truncation
+        for name in ["b-big_mixed_m3.rar", "b-text_PPMd.rar"] {
+            var rb = try Data(contentsOf: rdir.appendingPathComponent(name)); rb[rb.count / 2] ^= 0x33
+            let bad = work.appendingPathComponent("bad4-\(name)"); try rb.write(to: bad)
+            var det = false; do { try AXCore.test(bad, password: nil, progress: { _ in }) } catch { det = true }
+            check("rar4: corrupted data is detected (\(name))", det)
+            var rt = try Data(contentsOf: rdir.appendingPathComponent(name)); rt.removeLast(150_000)
+            let trunc = work.appendingPathComponent("trunc4-\(name)"); try rt.write(to: trunc)
+            var det2 = false; do { _ = try AXCore.list(trunc, password: nil); try AXCore.test(trunc, password: nil, progress: { _ in }) } catch { det2 = true }
+            check("rar4: truncated archive is detected (\(name))", det2)
+        }
+    } catch { check("section 10b threw", false, "\(error)") }
+}
+
 // MARK: 11. ISO 9660 and CPIO
 
 func sameContent(_ a: URL, _ b: URL) -> String? {      // names, types and bytes only (ISO/CPIO carry little else)

@@ -8,7 +8,7 @@ import CryptoKit
 
 // MARK: - Bit reader (MSB first)
 
-private final class RBits {
+final class RBits {
     private let src: ByteSource
     private var buf = [UInt8]()
     private var ip = 0
@@ -18,6 +18,8 @@ private final class RBits {
     private(set) var consumed: UInt64 = 0
 
     init(_ s: ByteSource) { src = s }
+    /// Bits left in the register (used to hand the stream back to byte-wise readers).
+    var bitsInRegister: Int { n }
 
     @inline(__always) func refill() throws {
         while n <= 56 {
@@ -41,7 +43,7 @@ private final class RBits {
     var overrun: Bool { n < 0 }
 }
 
-private struct RHuff {
+struct RHuff {
     var table = [UInt16](repeating: 0, count: 1 << 15)
     var used = false
 
@@ -327,17 +329,17 @@ final class Rar5Decoder {
 
 // MARK: - AES-256-CBC for RAR
 
-private final class RarAESSource: ByteSource {
+final class RarAESSource: ByteSource {
     private let input: ByteSource
     private var cryptor: CCCryptorRef?
     private var carry = Data()
     private var out = Data(); private var outPos = 0
     private var done = false
 
-    init(input: ByteSource, key: Data, iv: Data) throws {
+    init(input: ByteSource, key: Data, iv: Data, keyLength: Int = 32) throws {
         self.input = input
         let st = key.withUnsafeBytes { k in iv.withUnsafeBytes { v in
-            CCCryptorCreate(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), 0, k.baseAddress, 32, v.baseAddress, &cryptor)
+            CCCryptorCreate(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), 0, k.baseAddress, keyLength, v.baseAddress, &cryptor)
         } }
         guard st == kCCSuccess else { throw AXError.io("Could not start AES.") }
     }
@@ -365,7 +367,7 @@ private final class RarAESSource: ByteSource {
 }
 
 /// Reads at most `limit` bytes of a source (the unpacked size of a stored, padded, encrypted file).
-private final class LimitSource: ByteSource {
+final class LimitSource: ByteSource {
     private let input: ByteSource
     private var left: UInt64
     init(_ i: ByteSource, limit: UInt64) { input = i; left = limit }
@@ -384,6 +386,13 @@ struct RarEnc {
     var iv: Data
     var check: Data?
     var useMAC: Bool
+    var v3 = false                // RAR 3/4: AES-128, SHA-1 key derivation, no password check value
+}
+
+struct RarPart {
+    var file: FileIn
+    var offset: UInt64
+    var length: UInt64
 }
 
 struct RarEntry {
@@ -401,6 +410,10 @@ struct RarEntry {
     var dataOffset: UInt64 = 0
     var enc: RarEnc?
     var link: (type: Int, target: String)?
+    var unpVer = 50               // 50 = RAR 5; otherwise the RAR 1.x–4.x "unpack version" (29 = RAR 3/4)
+    var parts: [RarPart] = []     // RAR 3/4: where the packed data lives (several parts for multi-volume archives)
+    var dataLink = false          // RAR 3/4 symbolic link: the target is the (packed) file data
+    var incomplete = false        // a following volume is missing
     var unixMode: UInt32? { hostOS == 1 ? UInt32(truncatingIfNeeded: attrib) : nil }
 }
 
@@ -408,12 +421,16 @@ final class RarArchive {
     static let signature5: [UInt8] = [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00]
     static let signature4: [UInt8] = [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00]
 
-    let file: FileIn
-    private(set) var entries: [RarEntry] = []
-    private(set) var isSolid = false
-    private(set) var headersEncrypted = false
-    private let password: String?
+    var file: FileIn
+    var entries: [RarEntry] = []
+    var isSolid = false
+    var headersEncrypted = false
+    var generation = 5            // 5 = RAR 5 format, 4 = RAR 1.5–4.x format
+    var volumeCount = 1
+    var newNumbering = false
+    let password: String?
     private var keyCache: [String: (key: Data, hashKey: Data, check: Data)] = [:]
+    var keyCache3: [String: (key: Data, iv: Data)] = [:]
 
     static func isRar5(_ url: URL) -> Bool {
         guard let f = try? FileIn(url), let h = try? f.read(at: 0, 8) else { return false }
@@ -471,7 +488,7 @@ final class RarArchive {
 
     private func parse() throws {
         let head = try file.read(at: 0, 8)
-        if Array(head.prefix(7)) == RarArchive.signature4 { throw AXError.unsupported("this is an older RAR 4 archive; ArchiveX opens RAR 5 archives") }
+        if Array(head.prefix(7)) == RarArchive.signature4 { generation = 4; try parse4(); return }
         guard Array(head) == RarArchive.signature5 else { throw AXError.corrupt("not a RAR 5 archive") }
         var pos: UInt64 = 8
         var headerKey: Data?
@@ -590,7 +607,7 @@ final class RarArchive {
         var l = Listing()
         l.solid = isSolid
         l.headerEncrypted = headersEncrypted
-        l.details = (["RAR 5"] + (isSolid ? ["solid"] : []) + (entries.contains { $0.enc != nil } || headersEncrypted ? ["AES-256"] : []) + (headersEncrypted ? ["encrypted names"] : [])).joined(separator: " · ")
+        l.details = (["RAR \(generation)"] + (isSolid ? ["solid"] : []) + (volumeCount > 1 ? ["\(volumeCount) volumes"] : []) + (entries.contains { $0.enc != nil } || headersEncrypted ? [generation == 4 ? "AES-128" : "AES-256"] : []) + (headersEncrypted ? ["encrypted names"] : [])).joined(separator: " · ")
         l.entries = entries.map { e in
             let size = Int64(e.size ?? 0)
             let clean = SafePath.clean(e.name) ?? e.name
@@ -602,6 +619,12 @@ final class RarArchive {
     }
 
     private var decoder: Rar5Decoder?
+    private var decoder4: Rar4Decoder?
+
+    private func decoder4For() -> Rar4Decoder {
+        if let d = decoder4 { return d }
+        let d = Rar4Decoder(); decoder4 = d; return d
+    }
 
     private func decoderFor() -> Rar5Decoder {
         if let d = decoder { return d }
@@ -617,9 +640,17 @@ final class RarArchive {
     }
 
     private func source(for e: RarEntry) throws -> (ByteSource, Data?) {
-        var s: ByteSource = RangeSource(file: file, offset: e.dataOffset, length: e.packSize)
+        var s: ByteSource
+        if e.parts.isEmpty { s = RangeSource(file: file, offset: e.dataOffset, length: e.packSize) }
+        else {
+            if e.incomplete { throw AXError.corrupt("The next volume of this archive is missing, so “\(e.name)” can’t be read.") }
+            s = ConcatSource(e.parts.map { RangeSource(file: $0.file, offset: $0.offset, length: $0.length) })
+        }
         var hashKey: Data?
-        if let enc = e.enc {
+        if let enc = e.enc, enc.v3 {
+            let k = try derive3(salt: enc.salt)
+            s = try RarAESSource(input: s, key: k.key, iv: k.iv, keyLength: 16)
+        } else if let enc = e.enc {
             let keys = try derive(salt: enc.salt, log2: enc.log2)
             try verifyPassword(enc, keys)
             s = try RarAESSource(input: s, key: keys.key, iv: enc.iv)
@@ -638,7 +669,14 @@ final class RarArchive {
 
     /// Decodes one entry's data into `sink`, verifying its checksum.
     private func extractData(_ e: RarEntry, to sink: ByteSink, progress: ProgressTracker?) throws {
-        if e.size == 0 { return }                                   // nothing to decode (and nothing to checksum)
+        if e.size == 0 {
+            // Nothing to write or checksum. But an empty file inside a solid RAR 3/4 stream still carries the stream's
+            // end-of-block marker, which tells the decoder whether the next file starts with new tables.
+            guard e.unpVer < 50, e.unpVer >= 29, e.method != 0, e.packSize > 0, e.solid, !e.incomplete else { return }
+            let (src, _) = try source(for: e)
+            try decoder4For().decode(input: src, size: 0, solid: true, sink: NullSink(), progress: nil)
+            return
+        }
         let (src, hashKey) = try source(for: e)
         let crcSink = CRCSink(out: sink)
         do {
@@ -650,11 +688,13 @@ final class RarArchive {
                     if d.isEmpty { throw AXError.corrupt("“\(e.name)” ended unexpectedly") }
                     left -= UInt64(d.count); try crcSink.write(d); try progress?.add(d.count)
                 }
+            } else if e.unpVer < 50 {
+                try decoder4For().decode(input: src, size: e.size, solid: e.solid, sink: crcSink, progress: progress)
             } else {
                 try decoderFor().decode(input: src, size: e.size, solid: e.solid, sink: crcSink, progress: progress)
             }
         } catch let err as AXError {
-            if e.enc != nil, case .corrupt = err { throw AXError.wrongPassword }
+            if e.enc != nil { switch err { case .corrupt, .unsupported: throw AXError.wrongPassword; default: break } }
             throw err
         }
         if let want = e.crc {
@@ -673,6 +713,14 @@ final class RarArchive {
                 if wanted, ex.keepPaths, let u = try ex.destination(for: e.name, isDir: true) {
                     try FileManager.default.createDirectory(at: u, withIntermediateDirectories: true); ex.finalize(u, mode: e.unixMode, mtime: e.mtime)
                 }
+                continue
+            }
+            if e.dataLink {
+                if wanted {
+                    let mem = MemorySink()
+                    try extractData(e, to: mem, progress: nil)
+                    if let u = try ex.destination(for: e.name, isDir: false) { ex.makeSymlink(at: u, target: String(decoding: mem.data, as: UTF8.self)) }
+                } else if e.solid || isSolid { try extractData(e, to: NullSink(), progress: nil) }
                 continue
             }
             if let l = e.link {
@@ -698,7 +746,7 @@ final class RarArchive {
     }
 
     func test(progress: ProgressTracker?) throws {
-        for e in entries where !e.isDir && e.link == nil {
+        for e in entries where !e.isDir && e.link == nil && !e.dataLink {
             try Task.checkCancellation()
             try extractData(e, to: NullSink(), progress: progress)
         }

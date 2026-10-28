@@ -50,6 +50,10 @@ enum AXCore {
         if n.hasSuffix(".iso") { return .iso }
         if n.hasSuffix(".cpio") { return .cpio }
         if n.hasSuffix(".rar") { return .rar }
+        if n.count > 4, let dot = n.lastIndex(of: "."), n.distance(from: dot, to: n.endIndex) == 4 {       // old volume names: .r00 … .r99, .s00 …
+            let ext = n[n.index(after: dot)...]
+            if (ext.first == "r" || ext.first == "s"), ext.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber }) { return .rar }
+        }
         if n.hasSuffix(".tar") { return .tar }
         if n.hasSuffix(".gz") { return .gz }
         return nil

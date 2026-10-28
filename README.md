@@ -7,7 +7,7 @@
 
 <p align="center">
   <b>A fast, native archive manager for macOS — with its own archive engine.</b><br>
-  Open, create and extract ZIP, 7z, RAR 5, TAR and more in a clean WinRAR-style window.
+  Open, create and extract ZIP, 7z, RAR (all versions from 3 up), TAR and more in a clean WinRAR-style window.
 </p>
 
 <p align="center">
@@ -42,6 +42,7 @@
 | **ZIP** — Deflate, store, ZIP64, AES-256, ZipCrypto, UTF-8 names | ✅ | ✅ | ✅ |
 | **7z** — LZMA2, LZMA, BZip2, Deflate, store, BCJ / ARM / ARM64 / Delta filters, AES-256, encrypted file names, solid | ✅ | ✅ | ✅ |
 | **RAR 5** — all methods, solid, filters, AES-256, encrypted headers | ✅ | ❌ ¹ | ❌ |
+| **RAR 3 / RAR 4** — LZ and PPMd text compression, all six filters, AES-128, encrypted file names, solid, multi-volume sets (`.part01.rar`, `.rar`/`.r00`) | ✅ | ❌ ¹ | ❌ |
 | **TAR** (ustar, pax, GNU) | ✅ | ✅ | ✅ |
 | **TAR.GZ · TAR.BZ2 · TAR.XZ** | ✅ | ✅ | — |
 | **GZ · BZ2 · XZ** single files | ✅ | — | — |
@@ -50,8 +51,8 @@
 
 ¹ RARLAB's license reserves the RAR compression algorithm, so ArchiveX can read RAR but will never create it.
 
-**Not supported (yet):** RAR 4 (the older RAR format), DMG, CAB, WIM, XAR, ARJ, LZH, multi-volume archives,
-7z archives that use PPMd or BCJ2. ArchiveX tells you plainly when it meets one of these.
+**Not supported (yet):** RAR 1.x / 2.x (pre-2000 archives), multi-volume RAR 5, DMG, CAB, WIM, XAR, ARJ, LZH,
+split ZIP / 7z volumes, 7z archives that use PPMd or BCJ2. ArchiveX tells you plainly when it meets one of these.
 
 ## Install
 
@@ -121,13 +122,13 @@ Run the tests (needs the oracle tools above installed locally — see [`Tests/RE
 
 ```
 SwiftUI window  →  ArchiveModel  →  ArchiveX Core (Sources/Core)
- (Views, Sheets)   (state, actions)     ZIP · 7z · RAR 5 · TAR · GZ · BZ2 · XZ · ISO · CPIO
-                                        LZMA/LZMA2 · BZip2 · Inflate · AES · BCJ filters
+ (Views, Sheets)   (state, actions)     ZIP · 7z · RAR 3/4/5 · TAR · GZ · BZ2 · XZ · ISO · CPIO
+                                        LZMA/LZMA2 · PPMd · BZip2 · Inflate · AES · BCJ filters
 ```
 
-- `Core/Zip.swift`, `SevenZip.swift`, `Rar5.swift`, `Tar.swift`, `Xz.swift`, `Gzip.swift`, `Bzip2.swift`, `Disc.swift` —
+- `Core/Zip.swift`, `SevenZip.swift`, `Rar5.swift`, `Rar4.swift`, `Tar.swift`, `Xz.swift`, `Gzip.swift`, `Bzip2.swift`, `Disc.swift` —
   container formats.
-- `Core/Lzma.swift`, `Inflate.swift`, `Bzip2.swift`, `Filters.swift`, `Crypto.swift` — the codecs, written from the
+- `Core/Lzma.swift`, `Ppmd7.swift`, `Inflate.swift`, `Bzip2.swift`, `Filters.swift`, `Crypto.swift` — the codecs, written from the
   published format descriptions. Deflate *compression* uses Apple's Compression framework; AES, SHA and PBKDF2 use
   Apple's CommonCrypto / CryptoKit.
 - `Core/AXCore.swift` — the façade the app calls: list, extract, test, create, edit — all in-process and cancellable.
@@ -150,4 +151,4 @@ OSI-approved "open source" license, because open-source licenses must allow comm
 
 ArchiveX is an independent project and is not affiliated with RARLAB, WinRAR or 7-Zip. Archive formats are
 implemented from their public specifications; the RAR compression algorithm is **never** re-created — ArchiveX only
-decompresses RAR 5, as RARLAB's license permits.
+decompresses RAR, as RARLAB's license permits.
