@@ -15,6 +15,7 @@
   <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Apple%20Silicon%20%2B%20Intel-universal-444">
   <img alt="SwiftUI" src="https://img.shields.io/badge/SwiftUI-native-0A84FF">
   <img alt="No third-party code" src="https://img.shields.io/badge/third--party%20code-none-2EA043">
+  <img alt="PolyForm Noncommercial" src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-orange">
 </p>
 
 <p align="center">
@@ -133,6 +134,12 @@ SwiftUI window  →  ArchiveModel  →  ArchiveX Core (Sources/Core)
 
 ## License
 
-See [`LICENSE`](LICENSE). ArchiveX is an independent project and is not affiliated with RARLAB, WinRAR or 7-Zip.
-Archive formats are implemented from their public specifications; the RAR compression algorithm is **never**
-re-created — ArchiveX only decompresses RAR 5, as RARLAB's license permits.
+**Free for noncommercial use.** ArchiveX is source-available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE): you can use, study, modify and share it for personal, hobby,
+research, educational and nonprofit purposes. **You may not sell it, bundle it into a paid product, or otherwise use
+it commercially.** For commercial licensing, contact the author. (This is a source-available license, not an
+OSI-approved "open source" license, because open-source licenses must allow commercial use.)
+
+ArchiveX is an independent project and is not affiliated with RARLAB, WinRAR or 7-Zip. Archive formats are
+implemented from their public specifications; the RAR compression algorithm is **never** re-created — ArchiveX only
+decompresses RAR 5, as RARLAB's license permits.

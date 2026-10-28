@@ -248,6 +248,57 @@ do {
     check("zip-slip: escaping symlink refused", (try? fm.destinationOfSymbolicLink(atPath: dest.appendingPathComponent("evil-link").path)) == nil)
 } catch { check("section 5 threw", false, "\(error)") }
 
+// MARK: 5b. symlink attacks on the extractor
+
+do {
+    let tmp = work.appendingPathComponent("atk-payload.txt"); try "pwned".write(to: tmp, atomically: true, encoding: .utf8)
+
+    // (a) a link that looks inside but, once another link is walked back out with "..", escapes the folder
+    let outer = work.appendingPathComponent("atk-a"); try fm.createDirectory(at: outer, withIntermediateDirectories: true)
+    let za = work.appendingPathComponent("atk-a.zip")
+    let wa = try ZipWriter(url: za, password: nil, level: 0)
+    try wa.addSymlink(name: "a/b/s1", target: "../..", mtime: Date())            // points at the destination root: fine
+    try wa.addSymlink(name: "y", target: "a/b/s1/..", mtime: Date())            // physically = the parent of the destination
+    try wa.addFile(source: tmp, name: "y/evil.txt", mtime: Date(), mode: 0o644, progress: nil)
+    try wa.finish()
+    let inner = outer.appendingPathComponent("inner")
+    let skippedA = try AXCore.extract(za, selection: [], to: inner, overwrite: .all, keepPaths: true, password: nil, progress: { _ in })
+    var escapedA = fm.fileExists(atPath: outer.appendingPathComponent("evil.txt").path)
+    if let real = try? URL(fileURLWithPath: inner.appendingPathComponent("y").path).resolvingSymlinksInPath().path, real.hasSuffix("/atk-a") { escapedA = true }
+    check("symlink chain: a link that resolves above the folder is refused", !escapedA && skippedA.contains { $0.hasPrefix("y") }, "\(skippedA)")
+    check("symlink chain: the harmless link inside the folder is still created", (try? fm.destinationOfSymbolicLink(atPath: inner.appendingPathComponent("a/b/s1").path)) == "../..")
+
+    // (b) an existing symlink in the destination that points outside: directories and files must not go through it
+    let outside = work.appendingPathComponent("atk-outside"); try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+    try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: outside.path)
+    let dest = work.appendingPathComponent("atk-b/dest"); try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+    try fm.createSymbolicLink(atPath: dest.appendingPathComponent("link").path, withDestinationPath: outside.path)
+    let zb = work.appendingPathComponent("atk-b.zip")
+    let wb = try ZipWriter(url: zb, password: nil, level: 0)
+    try wb.addDirectory(name: "link", mtime: Date(timeIntervalSince1970: 1_000_000_000), mode: 0o777)
+    try wb.addFile(source: tmp, name: "link/evil.txt", mtime: Date(), mode: 0o644, progress: nil)
+    try wb.addFile(source: tmp, name: "link", mtime: Date(), mode: 0o644, progress: nil)       // a file over the symlink
+    try wb.finish()
+    _ = try? AXCore.extract(zb, selection: [], to: dest, overwrite: .all, keepPaths: true, password: nil, progress: { _ in })
+    let outsideFiles = (try? fm.contentsOfDirectory(atPath: outside.path)) ?? []
+    let outsideMode = ((try? fm.attributesOfItem(atPath: outside.path)[.posixPermissions]) as? NSNumber)?.intValue
+    let outsideDate = (try? fm.attributesOfItem(atPath: outside.path)[.modificationDate]) as? Date
+    check("existing symlink: nothing is written outside the destination", outsideFiles.isEmpty, "\(outsideFiles)")
+    check("existing symlink: permissions and dates outside are not touched", outsideMode == 0o700 && (outsideDate ?? Date()).timeIntervalSince1970 > 1_100_000_000, "\(String(describing: outsideMode)) \(String(describing: outsideDate))")
+
+    // (c) tar flavour: a symlink entry followed by a file written "through" it
+    let tarSrc = work.appendingPathComponent("atk-tar-src"); try fm.createDirectory(at: tarSrc, withIntermediateDirectories: true)
+    try fm.createSymbolicLink(atPath: tarSrc.appendingPathComponent("esc").path, withDestinationPath: "../")
+    let tarAtk = work.appendingPathComponent("atk.tar")
+    let tf = try FileOut(tarAtk); let tw = TarWriter(sink: tf)
+    try tw.addSymlink(name: "esc", target: "../", mode: 0o755, mtime: Date())
+    try tw.addFile(source: tmp, name: "esc/evil-from-tar.txt", mode: 0o644, mtime: Date(), progress: nil)
+    try tw.finish()
+    let tdest = work.appendingPathComponent("atk-c/dest")
+    _ = try AXCore.extract(tarAtk, selection: [], to: tdest, overwrite: .all, keepPaths: true, password: nil, progress: { _ in })
+    check("tar: a file written through an escaping symlink does not land outside", !fm.fileExists(atPath: work.appendingPathComponent("atk-c/evil-from-tar.txt").path))
+} catch { check("section 5b threw", false, "\(error)") }
+
 // MARK: 6. corruption is detected, not ignored
 
 do {

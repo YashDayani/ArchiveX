@@ -107,7 +107,7 @@ final class FileOut: ByteSink {
 
     init(_ url: URL, mode: mode_t = 0o644) throws {
         self.url = url
-        fd = open(url.path, O_RDWR | O_CREAT | O_TRUNC, mode)
+        fd = open(url.path, O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, mode)
         guard fd >= 0 else { throw AXError.io("Can’t create “\(url.lastPathComponent)”: \(String(cString: strerror(errno)))") }
     }
     deinit { close(fd) }
@@ -210,22 +210,47 @@ final class Extractor {
         return selection.contains { $0.path == path || ($0.isDir && path.hasPrefix($0.path + "/")) }
     }
 
+    private func inside(_ path: String) -> Bool { path == rootReal || path.hasPrefix(rootReal + "/") }
+
+    /// Creates the parent folders of `relative` one component at a time, checking after every step that the real
+    /// (symlink-resolved) location is still inside the destination. Returns nil when the path would leave it.
+    private func safeParent(of relative: String) throws -> URL? {
+        let comps = relative.split(separator: "/").dropLast().map(String.init)
+        var cur = rootReal
+        let fm = FileManager.default
+        for c in comps {
+            let next = cur + "/" + c
+            var st = stat()
+            if lstat(next, &st) == 0 {
+                if (st.st_mode & S_IFMT) == S_IFLNK {                           // an existing symlink: only follow it if it stays inside
+                    let real = URL(fileURLWithPath: next).resolvingSymlinksInPath().path
+                    guard inside(real) else { return nil }
+                    cur = real
+                } else { cur = next }
+            } else {
+                try fm.createDirectory(atPath: next, withIntermediateDirectories: false)
+                cur = next
+            }
+            guard inside(cur) else { return nil }
+        }
+        return URL(fileURLWithPath: cur)
+    }
+
     /// Where a member should be written, or nil to skip it (unsafe, or "skip existing").
     func destination(for rawName: String, isDir: Bool) throws -> URL? {
         guard let rel = SafePath.clean(rawName) else { skippedUnsafe.append(rawName); return nil }
         let relative = keepPaths ? rel : (rel as NSString).lastPathComponent
-        var url = root.appendingPathComponent(relative)
         let fm = FileManager.default
+        guard let parent = try safeParent(of: relative) else { skippedUnsafe.append(rawName); return nil }
+        var url = parent.appendingPathComponent((relative as NSString).lastPathComponent)
 
-        // Resolve symlinks in the parent chain: a previously extracted symlink must not redirect writes.
-        let parent = url.deletingLastPathComponent()
-        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
-        let parentReal = parent.resolvingSymlinksInPath().path
-        guard parentReal == rootReal || parentReal.hasPrefix(rootReal + "/") else {
-            skippedUnsafe.append(rawName); return nil
+        if isDir {
+            // never "create" a folder over a symlink: attributes would then be applied to wherever it points
+            if isSymlink(url) { skippedUnsafe.append(rawName); return nil }
+            extracted += 1
+            return url
         }
-
-        if !isDir, fm.fileExists(atPath: url.path) || (try? url.checkResourceIsReachable()) == true || isSymlink(url) {
+        if fm.fileExists(atPath: url.path) || (try? url.checkResourceIsReachable()) == true || isSymlink(url) {
             switch overwrite {
             case .skip: return nil
             case .all: try? fm.removeItem(at: url)
@@ -256,20 +281,45 @@ final class Extractor {
 
     /// Applies permissions and modification time recorded in the archive.
     func finalize(_ url: URL, mode: UInt32?, mtime: Date?) {
+        guard !isSymlink(url) else { return }
         var attrs: [FileAttributeKey: Any] = [:]
         if let mode { attrs[.posixPermissions] = Int(mode & 0o7777) }
         if let mtime { attrs[.modificationDate] = mtime }
         if !attrs.isEmpty { try? FileManager.default.setAttributes(attrs, ofItemAtPath: url.path) }
     }
 
+    /// True when following `target` from `directory` (a real path inside the destination) never leaves the destination.
+    /// Existing symlinks along the way are expanded component by component, so tricks like a link that points at a
+    /// deeper-looking path and is then walked back out with `..` are caught.
+    private func staysInside(_ target: String, from directory: String) -> Bool {
+        var cur = directory
+        var pending = target.split(separator: "/").map(String.init).reversed() as [String]
+        var hops = 0
+        while let c = pending.popLast() {
+            if c.isEmpty || c == "." { continue }
+            if c == ".." {
+                if cur == rootReal { return false }
+                cur = (cur as NSString).deletingLastPathComponent
+                continue
+            }
+            let next = cur + "/" + c
+            var st = stat()
+            if lstat(next, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK {
+                hops += 1
+                guard hops <= 40, let t = try? FileManager.default.destinationOfSymbolicLink(atPath: next), !t.hasPrefix("/") else { return false }
+                pending.append(contentsOf: t.split(separator: "/").map(String.init).reversed())
+                continue
+            }
+            cur = next
+        }
+        return inside(cur)
+    }
+
     /// Creates a symlink only when it stays inside the destination.
     func makeSymlink(at url: URL, target: String) {
         guard !target.hasPrefix("/") else { skippedUnsafe.append(url.lastPathComponent + " → " + target); return }
-        let resolved = url.deletingLastPathComponent().appendingPathComponent(target).standardized.path
-        let rootStd = root.standardized.path
-        guard resolved == rootStd || resolved.hasPrefix(rootStd + "/") else {
-            skippedUnsafe.append(url.lastPathComponent + " → " + target); return
-        }
+        let dir = url.deletingLastPathComponent().resolvingSymlinksInPath().path
+        guard inside(dir), staysInside(target, from: dir) else { skippedUnsafe.append(url.lastPathComponent + " → " + target); return }
         try? FileManager.default.createSymbolicLink(atPath: url.path, withDestinationPath: target)
     }
 }
