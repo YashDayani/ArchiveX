@@ -67,7 +67,7 @@ final class FileIn {
     let size: UInt64
     let url: URL
     /// One entry per file; a split archive (name.7z.001, name.7z.002, …) reads as one continuous file.
-    private(set) var parts: [(fd: Int32, start: UInt64, size: UInt64)] = []
+    private(set) var parts: [(fd: Int32, start: UInt64, size: UInt64, base: UInt64)] = []
     let partURLs: [URL]
 
     convenience init(_ url: URL) throws { try self.init(parts: [url], shownAs: url) }
@@ -84,10 +84,23 @@ final class FileIn {
             }
             var st = stat()
             fstat(fd, &st)
-            parts.append((fd, start, UInt64(st.st_size)))
+            parts.append((fd, start, UInt64(st.st_size), 0))
             start += UInt64(st.st_size)
         }
         size = start
+    }
+    /// A window onto part of a file (a payload inside a package), readable like a file of its own.
+    init(window u: URL, offset: UInt64, length: UInt64) throws {
+        url = u
+        partURLs = [u]
+        let fd = open(u.path, O_RDONLY)
+        guard fd >= 0 else { throw AXError.io("Can’t open “\(u.lastPathComponent)”: \(String(cString: strerror(errno)))") }
+        var st = stat()
+        fstat(fd, &st)
+        let avail = UInt64(st.st_size) > offset ? UInt64(st.st_size) - offset : 0
+        let len = min(length, avail)
+        parts = [(fd, 0, len, offset)]
+        size = len
     }
     deinit { for p in parts { close(p.fd) } }
 
@@ -99,7 +112,7 @@ final class FileIn {
         for p in parts where got < count && pos < p.start + p.size {
             let inPart = pos - p.start
             let want = min(count - got, Int(p.size - inPart))
-            let n = data.withUnsafeMutableBytes { pread(p.fd, $0.baseAddress! + got, want, off_t(inPart)) }
+            let n = data.withUnsafeMutableBytes { pread(p.fd, $0.baseAddress! + got, want, off_t(inPart + p.base)) }
             if n < 0 { throw AXError.io("Read error: \(String(cString: strerror(errno)))") }
             got += n; pos += UInt64(n)
             if n < want { break }

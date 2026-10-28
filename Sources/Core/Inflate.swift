@@ -121,6 +121,12 @@ final class Inflater {
         dist = try HuffTable(lengths: Array(lengths[hlit...]))
     }
 
+    /// Starts a new deflate stream but keeps the last 32 KB of output as its dictionary (CAB "MSZIP" blocks work this way).
+    func restartKeepingWindow() {
+        buf.removeAll(); ip = 0; bits = 0; nbits = 0
+        state = .blockHeader; lastBlock = false; chunk.removeAll(keepingCapacity: true)
+    }
+
     /// Feeds more compressed bytes. `final` promises that no more input will follow.
     /// Returns whether the final block was completed and how many of `data`'s bytes were not used.
     @discardableResult

@@ -3,11 +3,13 @@ import Foundation
 // The façade the app talks to. Every function here is synchronous and cancellable
 // (Task.checkCancellation), so the model runs them on a background task.
 
-enum AXKind { case zip, tar, gz, tgz, bz2, tbz2, xz, txz, sevenZ, rar, iso, cpio }
+enum AXKind { case zip, tar, gz, tgz, bz2, tbz2, xz, txz, sevenZ, rar, iso, cpio, ar, lzw, rpm, xar, cab, dmg }
 
 extension AXKind {
     /// kinds whose payload is one compressed stream
     var isStream: Bool { self == .gz || self == .bz2 || self == .xz }
+    /// kinds handled through the generic `ContainerArchive` layer
+    var isContainer: Bool { self == .ar || self == .lzw || self == .rpm || self == .xar || self == .cab || self == .dmg }
     /// kinds that are a tar inside a compressor
     var isCompressedTar: Bool { self == .tgz || self == .tbz2 || self == .txz }
     var isTarLike: Bool { self == .tar || isCompressedTar }
@@ -53,6 +55,12 @@ enum AXCore {
         if n.hasSuffix(".7z") { return .sevenZ }
         if n.hasSuffix(".iso") { return .iso }
         if n.hasSuffix(".cpio") { return .cpio }
+        for e in [".deb", ".udeb", ".ar", ".a"] where n.hasSuffix(e) { return .ar }
+        if n.hasSuffix(".rpm") { return .rpm }
+        if n.hasSuffix(".xar") || n.hasSuffix(".pkg") || n.hasSuffix(".mpkg") { return .xar }
+        if n.hasSuffix(".cab") { return .cab }
+        if n.hasSuffix(".dmg") { return .dmg }
+        if n.hasSuffix(".z") { return .lzw }
         if n.hasSuffix(".rar") { return .rar }
         if n.count > 4, let dot = n.lastIndex(of: "."), n.distance(from: dot, to: n.endIndex) == 4 {       // old volume names: .r00 … .r99, .s00 …
             let ext = n[n.index(after: dot)...]
@@ -61,6 +69,18 @@ enum AXCore {
         if n.hasSuffix(".tar") { return .tar }
         if n.hasSuffix(".gz") { return .gz }
         return nil
+    }
+
+    static func container(_ url: URL, _ k: AXKind) throws -> ContainerArchive {
+        switch k {
+        case .ar: return try ArArchive(url: url)
+        case .lzw: return try LzwArchive(url: url)
+        case .rpm: return try RpmArchive(url: url)
+        case .xar: return try XarArchive(url: url)
+        case .cab: return try CabArchive(url: url)
+        case .dmg: return try DmgArchive(url: url)
+        default: throw AXError.unsupported(url.pathExtension)
+        }
     }
 
     static func handles(_ url: URL) -> Bool { kind(of: url) != nil }
@@ -106,6 +126,8 @@ enum AXCore {
             return try IsoArchive(url: url).listing
         case .cpio:
             return try CpioArchive(url: url).listing
+        case .ar, .lzw, .rpm, .xar, .cab, .dmg:
+            return Container.listing(try container(url, k))
         case .tar, .tgz, .tbz2, .txz:
             let (src, f) = try tarSource(url, k)
             let reader = TarReader(src)
@@ -158,6 +180,9 @@ enum AXCore {
             let total = z.entries.filter { !$0.isDir && (selection.isEmpty || ex.isSelected(SafePath.clean($0.name) ?? "")) }
                 .reduce(Int64(0)) { $0 + Int64($1.usize) }
             try z.extract(selection: selection, to: ex, password: password, progress: ProgressTracker(total: total, report: progress))
+        case .ar, .lzw, .rpm, .xar, .cab, .dmg:
+            let z = try container(url, k)
+            try Container.extract(z, to: ex, progress: ProgressTracker(total: Container.total(z), report: progress))
         case .iso:
             let z = try IsoArchive(url: url)
             let total = z.entries.filter { !$0.isDir && ex.isSelected(SafePath.clean($0.path) ?? "") }.reduce(Int64(0)) { $0 + Int64($1.size) }
@@ -243,6 +268,9 @@ enum AXCore {
             let z = try ZipArchive(url: url)
             let total = z.entries.reduce(Int64(0)) { $0 + Int64($1.usize) }
             try z.test(password: password, progress: ProgressTracker(total: total, report: progress))
+        case .ar, .lzw, .rpm, .xar, .cab, .dmg:
+            let z = try container(url, k)
+            try Container.test(z, progress: ProgressTracker(total: Container.total(z), report: progress))
         case .iso:
             let z = try IsoArchive(url: url)
             try z.test(progress: ProgressTracker(total: z.entries.reduce(Int64(0)) { $0 + Int64($1.size) }, report: progress))
