@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal app
+        run: ./build.sh
+      - name: Check the bundle has no third-party code
+        run: |
+          lipo -archs build/ArchiveX.app/Contents/MacOS/ArchiveX
+          find build/ArchiveX.app -type f
+          ! otool -L build/ArchiveX.app/Contents/MacOS/ArchiveX | tail -n +2 | awk '{print $1}' | grep -v -E '^/(System|usr/lib)/'

@@ -1,0 +1,8 @@
+# build output
+build/
+
+# local helper binaries (third-party test oracles live outside the repository)
+vendor/
+oracles/
+
+.DS_Store
