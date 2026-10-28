@@ -16,4 +16,8 @@ jobs:
         run: |
           lipo -archs build/ArchiveX.app/Contents/MacOS/ArchiveX
           find build/ArchiveX.app -type f
-          ! otool -L build/ArchiveX.app/Contents/MacOS/ArchiveX | tail -n +2 | awk '{print $1}' | grep -v -E '^/(System|usr/lib)/'
+          # every linked library must be an Apple system library (otool prints one header line per architecture)
+          if otool -L build/ArchiveX.app/Contents/MacOS/ArchiveX | grep -v -E '^build/' | awk '{print $1}' | grep -v -E '^/(System|usr/lib)/'; then
+            echo "non-system library linked"; exit 1
+          fi
+          echo "only system libraries are linked"
