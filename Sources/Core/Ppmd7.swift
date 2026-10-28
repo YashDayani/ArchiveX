@@ -726,3 +726,56 @@ final class Ppmd7 {
         }
     }
 }
+
+// MARK: - 7z coder 030401
+
+/// Feeds the PPMd range decoder from a byte source; reads past the end give zeros, like 7-Zip's decoder.
+final class SourceByteInput: PpmdByteInput {
+    private let src: ByteSource
+    private var buf = [UInt8]()
+    private var pos = 0
+    private(set) var overrun = 0
+    init(_ s: ByteSource) { src = s }
+    func nextByte() throws -> Int {
+        if pos == buf.count {
+            let d = try src.read(1 << 16)
+            if d.isEmpty { overrun += 1; return 0 }
+            buf = [UInt8](d); pos = 0
+        }
+        defer { pos += 1 }
+        return Int(buf[pos])
+    }
+}
+
+/// PPMd (variant H) as stored in 7z: 5 property bytes (order, memory size), then a range-coded stream.
+final class PpmdSource: ByteSource {
+    private let ppm = Ppmd7(rar: false)
+    private let feed: SourceByteInput
+    private var left: UInt64
+
+    init(input: ByteSource, props: Data, unpackSize: UInt64) throws {
+        guard props.count >= 5 else { throw AXError.corrupt("bad PPMd properties") }
+        let order = Int(props[props.startIndex])
+        let mem = Int(props[props.startIndex + 1]) | Int(props[props.startIndex + 2]) << 8 | Int(props[props.startIndex + 3]) << 16 | Int(props[props.startIndex + 4]) << 24
+        guard order >= 2, order <= 64, mem >= 1 << 11, mem <= 0xFFFF_FFFF - 36 else { throw AXError.corrupt("bad PPMd properties") }
+        feed = SourceByteInput(input)
+        left = unpackSize
+        ppm.input = feed
+        try ppm.initRange()
+        try ppm.start(order: order, memory: mem)
+    }
+
+    func read(_ n: Int) throws -> Data {
+        let want = Int(min(UInt64(n), left, 1 << 16))
+        guard want > 0 else { return Data() }
+        var out = [UInt8](repeating: 0, count: want)
+        for i in 0..<want {
+            let c = try ppm.decodeChar()
+            guard c >= 0, feed.overrun < 8 else { throw AXError.corrupt("damaged PPMd data") }
+            out[i] = UInt8(c)
+        }
+        left -= UInt64(want)
+        return Data(out)
+    }
+    func skip(_ n: UInt64) throws { try discard(n) }
+}

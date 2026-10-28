@@ -529,11 +529,30 @@ do {
     // a BCJ-filtered archive must really contain the filter
     let bcjInfo = sh("\(SZ) l -slt \(q(foreign7.appendingPathComponent("f-bcj+lzma2.7z"))) | grep -i '^Method' | head -1").out
     check("7z read [bcj]: archive really uses the BCJ filter", bcjInfo.contains("BCJ"), bcjInfo)
-    // unsupported method fails cleanly
-    let ppmd = foreign7.appendingPathComponent("ppmd.7z")
-    sh("\(SZ) a -bso0 -t7z -m0=PPMd \(q(ppmd)) a.txt", cwd: src)
-    do { try AXCore.test(ppmd, password: nil, progress: { _ in }); check("7z PPMd: reported as unsupported", false) }
-    catch AXError.unsupported { check("7z PPMd: reported as unsupported", true) } catch { check("7z PPMd: reported as unsupported", false, "\(error)") }
+    // PPMd (text compression): orders, memory sizes (small sizes force the model to restart) and large mixed data
+    let pbig = work.appendingPathComponent("ppmdbig"); try fm.createDirectory(at: pbig, withIntermediateDirectories: true)
+    try Data((1...300_000).map { "line \($0): alpha beta gamma delta epsilon \($0 % 211)\n" }.joined().utf8).write(to: pbig.appendingPathComponent("big.txt"))
+    try Data((0..<(1 << 20)).map { _ in UInt8.random(in: 0...255) }).write(to: pbig.appendingPathComponent("noise.bin"))
+    try Data(contentsOf: URL(fileURLWithPath: "/usr/bin/curl")).write(to: pbig.appendingPathComponent("curl.bin"))
+    for (label, args) in [("default", "-m0=PPMd"), ("order 2", "-m0=PPMd:o=2"), ("order 32, 64 MB", "-m0=PPMd:o=32:mem=64m"), ("order 24, 16 MB", "-m0=PPMd:o=24:mem=16m"),
+                          ("1 MB (restarts)", "-m0=PPMd:o=8:mem=1m"), ("non-solid", "-m0=PPMd -ms=off"), ("encrypted", "-m0=PPMd \(aesPWArg)")] {
+        let a = foreign7.appendingPathComponent("p-\(label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: ",", with: "")).7z")
+        sh("\(SZ) a -bso0 -t7z \(args) \(q(a)) big.txt noise.bin curl.bin", cwd: pbig)
+        let pw = label == "encrypted"
+        let ref = ref7z(a, "p-\(label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: ",", with: ""))", pw: pw)
+        do {
+            let ours = try extractOurs(a, to: "x7p-\(label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: ",", with: ""))", password: pw ? aesPW : nil)
+            check("7z PPMd [\(label)]: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+            try AXCore.test(a, password: pw ? aesPW : nil, progress: { _ in })
+        } catch { check("7z PPMd [\(label)]", false, "\(error)") }
+    }
+    let ppmd = foreign7.appendingPathComponent("p-default.7z")
+    let ppmdInfo = sh("\(SZ) l -slt \(q(ppmd)) | grep -i '^Method' | head -1").out
+    check("7z PPMd: archive really uses PPMd", ppmdInfo.lowercased().contains("ppmd"), ppmdInfo)
+    var pb = try Data(contentsOf: ppmd); pb[pb.count / 2] ^= 0x5a
+    let pbad = work.appendingPathComponent("bad-ppmd.7z"); try pb.write(to: pbad)
+    var pdet = false; do { try AXCore.test(pbad, password: nil, progress: { _ in }) } catch { pdet = true }
+    check("7z PPMd: corrupted data is detected", pdet)
 
     // editing
     let ed = try make7z("edit.7z")

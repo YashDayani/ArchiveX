@@ -555,6 +555,7 @@ final class SevenZipArchive {
                 return try Lzma2Source(input: input, dictProp: p, sizeHint: size)
             case Method.lzma: return try LzmaSource(input: input, props: c.props, unpackSize: size)
             case Method.bzip2: return try Bzip2Source(source: input)
+            case Method.ppmd: return try PpmdSource(input: input, props: c.props, unpackSize: size)
             case Method.deflate: return InflateSource(input: input)
             case Method.bcjx86, Method.bcjx86Old: return FilterSource(input: input, filter: BCJx86())
             case Method.arm64: return FilterSource(input: input, filter: BCJARM64())
