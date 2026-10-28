@@ -34,5 +34,11 @@ else
   [ -f AppIcon.icns ] && cp AppIcon.icns "$APP/Contents/Resources/ArchiveX.icns"
 fi
 
-codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
+# Signing: with ARCHIVEX_SIGN_IDENTITY (a "Developer ID Application: ..." certificate) the app is signed for
+# distribution with the hardened runtime, ready for notarization. Without it, an ad-hoc signature is used.
+if [ -n "${ARCHIVEX_SIGN_IDENTITY:-}" ]; then
+  codesign --force --deep --options runtime --timestamp -s "$ARCHIVEX_SIGN_IDENTITY" "$APP"
+else
+  codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
+fi
 echo "Built $APP ($(lipo -archs "$APP/Contents/MacOS/ArchiveX"))"

@@ -57,12 +57,19 @@
 
 1. Download **ArchiveX.zip** from the [Releases](../../releases) page and unzip it.
 2. Drag **ArchiveX.app** into `/Applications`.
-3. First launch: macOS may say the app can’t be verified, because it is not notarized. **Right-click the app →
-   Open → Open**, or run once:
+3. **First launch.** ArchiveX is not notarized by Apple yet (that needs a paid Apple Developer ID), so macOS shows
+   *“ArchiveX” Not Opened — Apple could not verify…*. This is expected and does not mean anything is wrong with the app.
+   **Click “Done” (not “Move to Bin”), then:**
+   - **macOS 15 Sequoia and later:** open **System Settings → Privacy & Security**, scroll to the *Security* section,
+     click **Open Anyway** next to “ArchiveX was blocked”, and confirm with your password. You only do this once.
+   - **macOS 13–14:** right-click the app → **Open** → **Open**.
+   - **Any version, one command** (removes the download quarantine flag):
 
-   ```bash
-   xattr -dr com.apple.quarantine /Applications/ArchiveX.app
-   ```
+     ```bash
+     xattr -dr com.apple.quarantine /Applications/ArchiveX.app
+     ```
+
+   You can check that the download is genuine before opening it, as shown below.
 
 Verify your download (see [Releases](../../releases) for the checksum and provenance attestation):
 
@@ -127,7 +134,8 @@ SwiftUI window  →  ArchiveModel  →  ArchiveX Core (Sources/Core)
 
 ## Known limits
 
-- The app is ad-hoc signed and not notarized (see [Install](#install)).
+- The app is ad-hoc signed and not notarized, so macOS asks you to approve it once (see [Install](#install)). Releases are
+  signed and notarized automatically as soon as an Apple Developer ID is configured for the release workflow.
 - Compression ratios are close to, but not always identical to, those of 7-Zip. BZ2 compression is slow on highly
   repetitive data.
 - Editing a 7z archive rewrites it. TAR.GZ / TAR.BZ2 / TAR.XZ and RAR archives are read-only after creation.
