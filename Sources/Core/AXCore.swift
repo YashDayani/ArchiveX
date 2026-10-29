@@ -68,6 +68,7 @@ enum AXCore {
         if n.count > 4, let dot = n.lastIndex(of: "."), n.distance(from: dot, to: n.endIndex) == 4 {       // old volume names: .r00 … .r99, .s00 …
             let ext = n[n.index(after: dot)...]
             if (ext.first == "r" || ext.first == "s"), ext.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber }) { return .rar }
+            if ext.first == "z", ext.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber }) { return .zip }          // spanned ZIP: name.z01
         }
         if n.hasSuffix(".tar") { return .tar }
         if n.hasSuffix(".gz") { return .gz }

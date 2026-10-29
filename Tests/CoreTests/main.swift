@@ -210,6 +210,21 @@ do {
             try AXCore.test(a, password: pw, progress: { _ in })
         } catch { check("zip [\(label)]", false, "\(error)") }
     }
+    // Info-ZIP spanned archives (name.z01, name.z02, …, name.zip)
+    let zspan = work.appendingPathComponent("zipspan"); try fm.createDirectory(at: zspan, withIntermediateDirectories: true)
+    sh("/usr/bin/zip -q -s 150k -r \(q(zspan.appendingPathComponent("sp.zip"))) big.txt noise.bin", cwd: zbig)
+    if fm.fileExists(atPath: zspan.appendingPathComponent("sp.z02").path) {
+        let joined = zspan.appendingPathComponent("joined.zip")
+        sh("/usr/bin/zip -q -s 0 \(q(zspan.appendingPathComponent("sp.zip"))) --out \(q(joined))")
+        let ref = work.appendingPathComponent("refz-span"); sh("\(SZ) x -y -o\(q(ref)) \(q(joined))")
+        for opened in ["sp.zip", "sp.z01"] {
+            do {
+                let ours = try extractOurs(zspan.appendingPathComponent(opened), to: "ownz-span-\(opened)")
+                check("zip spanned (.z01 …) [open \(opened)]: matches 7-Zip's extraction of the joined archive", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+                try AXCore.test(zspan.appendingPathComponent(opened), password: nil, progress: { _ in })
+            } catch { check("zip spanned [\(opened)]", false, "\(error)") }
+        }
+    } else { check("zip spanned: the set was created", false) }
     let zsplit = work.appendingPathComponent("zipsplit"); try fm.createDirectory(at: zsplit, withIntermediateDirectories: true)
     sh("\(SZ) a -bso0 -tzip -v200k \(q(zsplit.appendingPathComponent("s.zip"))) big.txt noise.bin", cwd: zbig)
     do {

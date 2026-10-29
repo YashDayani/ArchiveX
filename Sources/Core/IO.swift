@@ -130,8 +130,28 @@ final class FileIn {
 
     /// Opens an archive, joining the parts of a split set when `url` names one.
     static func openArchive(_ url: URL) throws -> FileIn {
-        if let set = splitSet(for: url) { return try FileIn(parts: set, shownAs: url) }
+        if let set = splitSet(for: url) ?? zipSpanSet(for: url) { return try FileIn(parts: set, shownAs: url) }
         return try FileIn(url)
+    }
+
+    /// Info-ZIP style spanned archives: name.z01, name.z02, …, then name.zip last.
+    static func zipSpanSet(for url: URL) -> [URL]? {
+        let dir = url.deletingLastPathComponent()
+        let name = url.lastPathComponent
+        let ext = url.pathExtension.lowercased()
+        let base = (name as NSString).deletingPathExtension
+        guard ext == "zip" || (ext.count == 3 && ext.hasPrefix("z") && Int(ext.dropFirst()) != nil) else { return nil }
+        var out: [URL] = []
+        var i = 1
+        while true {
+            let u = dir.appendingPathComponent(base + ".z" + String(format: "%02d", i))
+            guard FileManager.default.fileExists(atPath: u.path) else { break }
+            out.append(u); i += 1
+        }
+        guard !out.isEmpty else { return nil }
+        let last = dir.appendingPathComponent(base + ".zip")
+        guard FileManager.default.fileExists(atPath: last.path) else { return nil }
+        return out + [last]
     }
 
     /// Finds the other parts of a split archive from the name of one of them (“x.7z.001”, “x.zip.002”, …).

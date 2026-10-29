@@ -52,6 +52,7 @@ final class ZipArchive {
     private(set) var entries: [ZipEntry] = []
     private(set) var prefix: UInt64 = 0          // bytes before the archive proper (SFX stubs)
     private(set) var cdOffset: UInt64 = 0
+    private var diskStarts: [UInt64] = []           // spanned (.z01 …) sets: where each disk begins in the joined file
     private(set) var comment = Data()
 
     init(url: URL) throws {
@@ -76,6 +77,13 @@ final class ZipArchive {
         let commentLen = Int(tail.le16(e + 20))
         if e + 22 + commentLen <= tail.count { comment = tail.subdata(in: tail.startIndex + e + 22..<tail.startIndex + e + 22 + commentLen) }
         var endOfCD = eocdAbs
+        // Info-ZIP style spanned sets: offsets are per disk, so they are shifted by where each disk starts in the joined file
+        let thisDisk = Int(tail.le16(e + 4)), cdDisk = Int(tail.le16(e + 6))
+        if thisDisk > 0 && file.parts.count > 1 {
+            var starts: [UInt64] = []
+            for pt in file.parts { starts.append(pt.start) }
+            diskStarts = starts
+        }
 
         if (total == 0xffff || cdSize == 0xffff_ffff || cdOff == 0xffff_ffff), eocdAbs >= 20 {
             let loc = try file.readExactly(at: eocdAbs - 20, 20)
@@ -87,7 +95,10 @@ final class ZipArchive {
                 endOfCD = z64Off
             }
         }
-        if cdOff + cdSize < endOfCD { prefix = endOfCD - (cdOff + cdSize) }
+        if !diskStarts.isEmpty {
+            guard cdDisk < diskStarts.count else { throw AXError.corrupt("bad spanned ZIP directory") }
+            cdOff += diskStarts[cdDisk]
+        } else if cdOff + cdSize < endOfCD { prefix = endOfCD - (cdOff + cdSize) }
         cdOffset = cdOff
 
         guard cdSize < 1 << 31 else { throw AXError.unsupported("central directory too large") }
@@ -104,6 +115,7 @@ final class ZipArchive {
             let nl = Int(cd.le16(p + 28)), xl = Int(cd.le16(p + 30)), cl = Int(cd.le16(p + 32))
             let intAttr = cd.le16(p + 36), extAttr = cd.le32(p + 38)
             var lho = UInt64(cd.le32(p + 42))
+            let startDisk = Int(cd.le16(p + 34))
             guard p + 46 + nl + xl + cl <= cd.count else { throw AXError.corrupt("truncated central directory") }
             let nameData = cd.subdata(in: cd.startIndex + p + 46..<cd.startIndex + p + 46 + nl)
             let extraData = cd.subdata(in: cd.startIndex + p + 46 + nl..<cd.startIndex + p + 46 + nl + xl)
@@ -144,6 +156,7 @@ final class ZipArchive {
                 q += 4 + len
             }
             if aesV == 2 { crc = 0 }
+            if !diskStarts.isEmpty { guard startDisk < diskStarts.count else { throw AXError.corrupt("bad spanned ZIP directory") }; lho += diskStarts[startDisk] }
             let name = unicodeName ?? String(data: nameData, encoding: .utf8) ?? String(data: nameData, encoding: .isoLatin1) ?? ""
             let isDir = name.hasSuffix("/") || name.hasSuffix("\\") || (madeBy >> 8 != 3 && extAttr & 0x10 != 0 && usize == 0)
             list.append(ZipEntry(name: name, isDir: isDir, flags: flags, method: method, realMethod: realMethod,
