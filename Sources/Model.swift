@@ -1,4 +1,6 @@
 import SwiftUI
+import CryptoKit
+import UniformTypeIdentifiers
 import AppKit
 
 struct AlertInfo: Identifiable {
@@ -61,6 +63,8 @@ final class ArchiveModel: ObservableObject {
     @Published var extractDraft: ExtractDraft?
     @Published var passwordPrompt = false
     @Published var password: String?
+    @Published var quickLookURL: URL?
+    @Published var searchQuery = ""
 
     private var afterPassword: (() -> Void)?
     private var cancelWork: (() -> Void)?
@@ -106,7 +110,24 @@ final class ArchiveModel: ObservableObject {
     // MARK: derived
 
     var visibleRows: [Row] {
-        let r = rows(from: entries, in: currentDir)
+        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let r: [Row]
+        if q.isEmpty {
+            r = rows(from: entries, in: currentDir)
+        } else {
+            let matched = entries.filter { e in
+                let name = (e.path as NSString).lastPathComponent.lowercased()
+                let full = e.path.lowercased()
+                if q.hasPrefix(".") {
+                    return name.hasSuffix(q) || full.hasSuffix(q)
+                }
+                return name.contains(q) || full.contains(q)
+            }
+            r = matched.map { e in
+                Row(id: e.path, name: e.path, isDir: e.isDir, size: e.size, packed: e.packed,
+                    ratio: e.ratio, mtime: e.mtime, crc: e.crc, encrypted: e.encrypted)
+            }
+        }
         guard packedPerFileUnknown else { return r }
         return r.map { var x = $0; x.hidePacked = true; x.ratio = ""; return x }
     }
@@ -235,6 +256,123 @@ final class ArchiveModel: ObservableObject {
             case .failure(let e): self.handle(e, title: "Can’t open file") { [weak self] in self?.view(row) }
             }
         }
+    }
+
+    // MARK: scratch files (previews, drag-out, clipboard)
+
+    private static let scratchRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ArchiveX-Scratch")
+    private static var scratchCleaned = false
+
+    /// Removes preview / drag / clipboard files left over from earlier runs. Done once per launch, before any are created.
+    static func cleanOldScratch() {
+        guard !scratchCleaned else { return }
+        scratchCleaned = true
+        let fm = FileManager.default
+        try? fm.removeItem(at: scratchRoot)
+        for n in (try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path)) ?? [] where n.hasPrefix("ArchiveX-") && n != "ArchiveX-Scratch" {
+            try? fm.removeItem(at: fm.temporaryDirectory.appendingPathComponent(n))
+        }
+    }
+
+    nonisolated private static func newScratch(_ label: String) -> URL {
+        let d = scratchRoot.appendingPathComponent("\(label)-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    /// A preview folder that is specific to one archive (and its current contents), so two archives that both hold
+    /// “readme.txt” never show each other's file.
+    private func previewFolder(for archive: URL) -> URL {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: archive.path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let digest = SHA256.hash(data: Data("\(archive.path)|\(size)|\(mtime)".utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        let d = Self.scratchRoot.appendingPathComponent("QuickLook-\(digest)")
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    func quickLookSelected() {
+        if quickLookURL != nil {
+            quickLookURL = nil
+            return
+        }
+        guard let url = archiveURL else { return }
+        guard let target = selectedRows.first(where: { !$0.isDir }) ?? visibleRows.first(where: { selection.contains($0.id) && !$0.isDir }) else { return }
+
+        let cacheDir = previewFolder(for: url)
+        let outURL = cacheDir.appendingPathComponent(target.id)
+
+        if FileManager.default.fileExists(atPath: outURL.path) {
+            self.quickLookURL = outURL
+            return
+        }
+
+        let pw = password
+        Task { [weak self] in
+            guard let self else { return }
+            switch await self.run("Preparing preview…", { p in
+                try AXCore.extract(url, selection: [(path: target.id, isDir: false)], to: cacheDir, overwrite: .all, keepPaths: true, password: pw, progress: p)
+            }) {
+            case .success:
+                self.quickLookURL = outURL
+            case .failure(let e):
+                self.handle(e, title: "Preview failed") { [weak self] in self?.quickLookSelected() }
+            }
+        }
+    }
+
+    /// What a drag out of the table carries. The file is not extracted when the drag starts: the receiver (Finder, Mail, …)
+    /// asks for it when it is dropped, and the extraction then runs on a background queue, so the window never freezes.
+    func fileProvider(for row: Row) -> NSItemProvider {
+        let provider = NSItemProvider()
+        provider.suggestedName = (row.id as NSString).lastPathComponent
+        guard let archive = archiveURL else { return provider }
+        let pw = password
+        let id = row.id, isDir = row.isDir
+        let type = isDir ? UTType.folder : (UTType(filenameExtension: (id as NSString).pathExtension) ?? .data)
+        provider.registerFileRepresentation(forTypeIdentifier: type.identifier, fileOptions: [], visibility: .all) { completion in
+            let progress = Progress(totalUnitCount: 1)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let dir = ArchiveModel.newScratch("Drag")
+                do {
+                    try AXCore.extract(archive, selection: [(path: id, isDir: isDir)], to: dir, overwrite: .all, keepPaths: true, password: pw, progress: { _ in })
+                    let out = dir.appendingPathComponent(id)
+                    guard FileManager.default.fileExists(atPath: out.path) else { throw AXError.io("The item could not be extracted.") }
+                    progress.completedUnitCount = 1
+                    completion(out, false, nil)
+                } catch { completion(nil, false, error) }
+            }
+            return progress
+        }
+        return provider
+    }
+
+    func copySelection() {
+        let rows = selectedRows
+        guard let url = archiveURL, !rows.isEmpty else { return }
+        let cacheDir = Self.newScratch("Clipboard")
+        let sel = selectionPairs
+        let pw = password
+        Task { [weak self] in
+            guard let self else { return }
+            switch await self.run("Copying to pasteboard…", { p in
+                try AXCore.extract(url, selection: sel, to: cacheDir, overwrite: .all, keepPaths: true, password: pw, progress: p)
+            }) {
+            case .success:
+                let urls = rows.map { cacheDir.appendingPathComponent($0.id) }.filter { FileManager.default.fileExists(atPath: $0.path) }
+                guard !urls.isEmpty else { return }
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.writeObjects(urls as [NSURL])
+            case .failure(let e):
+                self.handle(e, title: "Copy failed") { [weak self] in self?.copySelection() }
+            }
+        }
+    }
+
+    func selectAll() {
+        selection = Set(visibleRows.map(\.id))
     }
 
     // MARK: test / delete
