@@ -1,11 +1,14 @@
 import AppKit
 import Foundation
+import Security
 
 // Checks GitHub Releases for a newer ArchiveX and installs it.
 //
 // The release workflow publishes ArchiveX.zip and SHA256SUMS. An update is only installed when the zip arrives over HTTPS from
 // GitHub, matches the checksum in SHA256SUMS, unpacks to an app with our bundle identifier and a valid code signature, and is
-// newer than the running version. If the running app cannot be replaced in place, the new app is revealed in Finder instead.
+// newer than the running version. The new app must also be signed by the same developer as the running one (its designated
+// requirement). If the running app is only ad-hoc signed there is no signer to pin, and if it cannot be replaced in place, the new
+// app is revealed in Finder for the user to install by hand instead.
 
 struct UpdateOffer: Equatable {
     var version: String
@@ -48,6 +51,8 @@ struct AppVersion: Comparable, Equatable {
     static func == (a: AppVersion, b: AppVersion) -> Bool { !(a < b) && !(b < a) }
 }
 
+enum SignerTrust { case matches, cannotPin, mismatch }
+
 enum UpdateError: LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let m) = self { return m } else { return nil } }
@@ -62,7 +67,7 @@ final class Updater: ObservableObject {
         case available(UpdateOffer)
         case working(String, Double?)
         case failed(String)
-        case revealed(URL)
+        case revealed(URL, String)
     }
 
     static let shared = Updater()
@@ -79,6 +84,7 @@ final class Updater: ObservableObject {
     var appURL = Bundle.main.bundleURL
     var isTrustedDownload: (URL) -> Bool = Updater.isTrustedGitHubURL
     var defaults = UserDefaults.standard
+    var checkSigner: (URL) -> SignerTrust = Updater.signerTrust
     var relaunch: (_ script: URL, _ newApp: URL) -> Bool = Updater.launchHelper
 
     // MARK: Checking
@@ -186,9 +192,15 @@ final class Updater: ObservableObject {
         let newApp = try await Task.detached { try Self.unpack(zip, into: unpacked) }.value
         try validate(newApp, offer: offer)
 
-        guard Self.canReplace(appURL) else {
+        let trust = checkSigner(newApp)
+        if trust == .mismatch {
+            throw UpdateError.message("The new version is signed by a different developer than the one you have, so it was not installed.")
+        }
+        if trust == .cannotPin || !Self.canReplace(appURL) {
             try? fm.removeItem(at: zip)
-            state = .revealed(newApp)
+            state = .revealed(newApp, trust == .cannotPin
+                ? "This copy of ArchiveX is not signed with a developer certificate, so the update cannot be checked against its signer. The new version is shown in Finder."
+                : "ArchiveX can’t replace itself where it is installed, so the new version is shown in Finder.")
             NSWorkspace.shared.activateFileViewerSelecting([newApp])
             return
         }
@@ -253,6 +265,21 @@ final class Updater: ObservableObject {
         return nil
     }
 
+    /// Whether `newApp` satisfies the designated requirement of the running app, i.e. comes from the same signer.
+    /// A running app with only an ad-hoc signature has no signer to compare with, so nothing can be pinned.
+    nonisolated static func signerTrust(of newApp: URL) -> SignerTrust {
+        var me: SecCode?, mine: SecStaticCode?, info: CFDictionary?, req: SecRequirement?, new: SecStaticCode?
+        guard SecCodeCopySelf([], &me) == errSecSuccess, let me,
+              SecCodeCopyStaticCode(me, [], &mine) == errSecSuccess, let mine,
+              SecCodeCopySigningInformation(mine, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let dict = info as? [String: Any], dict[kSecCodeInfoTeamIdentifier as String] != nil,
+              ((dict[kSecCodeInfoFlags as String] as? UInt32) ?? 0) & SecCodeSignatureFlags.adhoc.rawValue == 0,
+              SecCodeCopyDesignatedRequirement(mine, [], &req) == errSecSuccess, let req else { return .cannotPin }
+        guard SecStaticCodeCreateWithPath(newApp as CFURL, [], &new) == errSecSuccess, let new else { return .mismatch }
+        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode)
+        return SecStaticCodeCheckValidity(new, flags, req) == errSecSuccess ? .matches : .mismatch
+    }
+
     /// The app can be swapped in place when its folder is writable and it is not running from a translocated copy.
     nonisolated static func canReplace(_ app: URL) -> Bool {
         let parent = app.deletingLastPathComponent().path
@@ -280,7 +307,6 @@ final class Updater: ObservableObject {
     old="$app.old-$$"
     mv "$app" "$old" || { open "$app"; exit 1; }
     if ditto "$new" "$app"; then
-      xattr -dr com.apple.quarantine "$app" 2>/dev/null
       rm -rf "$old" "$(dirname "$new")"
     else
       rm -rf "$app"; mv "$old" "$app"

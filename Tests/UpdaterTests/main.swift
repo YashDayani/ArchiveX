@@ -80,6 +80,7 @@ func makeRelease(version: String, bundleID: String = "io.feedspace.archivex", in
     // 6. full runs against local files
     let upd = Updater()
     upd.isTrustedDownload = { _ in true }
+    upd.checkSigner = { _ in .matches }
     upd.defaults = UserDefaults(suiteName: "archivex-updater-test-\(UUID().uuidString)")!
     upd.currentVersion = "1.0.0"
     upd.appURL = work.appendingPathComponent("Installed/ArchiveX.app")
@@ -139,6 +140,21 @@ func makeRelease(version: String, bundleID: String = "io.feedspace.archivex", in
     upd.state = .idle; upd.install(local)
     for _ in 0..<100 { if case .failed = upd.state { break }; try? await Task.sleep(nanoseconds: 50_000_000) }
     if case .failed(let m) = upd.state { check("a non-GitHub download location is refused", m.contains("not GitHub")) } else { check("a non-GitHub download location is refused", false, "\(upd.state)") }
+
+    // 6f. signer pinning: a different signer is refused; an unpinnable (ad-hoc) running app gets a manual install
+    upd.currentVersion = "1.0.0"; handedOff = nil; upd.isTrustedDownload = { _ in true }
+    upd.checkSigner = { _ in .mismatch }
+    upd.state = .idle; upd.install(local)
+    for _ in 0..<200 { if case .failed = upd.state { break }; try? await Task.sleep(nanoseconds: 50_000_000) }
+    if case .failed(let m) = upd.state { check("a different signer is refused", m.contains("different developer") && handedOff == nil, m) } else { check("a different signer is refused", false, "\(upd.state)") }
+    upd.checkSigner = { _ in .cannotPin }
+    upd.state = .idle; upd.install(local)
+    for _ in 0..<200 { if case .revealed = upd.state { break }; if case .failed = upd.state { break }; try? await Task.sleep(nanoseconds: 50_000_000) }
+    if case .revealed = upd.state { check("an unpinnable signer means manual install, not auto-install", handedOff == nil) } else { check("an unpinnable signer means manual install, not auto-install", false, "\(upd.state)") }
+    let realTrust = Updater.signerTrust(of: good.appendingPathComponent("ArchiveX.app"))
+    check("an ad-hoc running app cannot pin a signer (the real check)", realTrust == .cannotPin, "\(realTrust)")
+    check("the swap script no longer strips quarantine", !Updater.helperScript.contains("quarantine"))
+    upd.checkSigner = { _ in .matches }
 
     // 7. skipping a version silences quiet checks only
     upd.currentVersion = "1.0.0"; upd.releaseURL = feed; upd.state = .idle

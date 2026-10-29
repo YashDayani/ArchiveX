@@ -428,9 +428,9 @@ struct UpdateSheet: View {
                 Label("Couldn’t update", systemImage: "exclamationmark.triangle").font(.title3.weight(.semibold))
                 Text(message).fixedSize(horizontal: false, vertical: true)
                 buttons { Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
-            case .revealed:
+            case .revealed(_, let why):
                 Text("The new version is ready").font(.title3.weight(.semibold))
-                Text("ArchiveX can’t replace itself where it is installed, so the new app is shown in Finder. Quit ArchiveX and drag the new app over the old one (for example into Applications).")
+                Text("\(why) Quit ArchiveX and drag the new app over the old one (for example into Applications).")
                     .fixedSize(horizontal: false, vertical: true)
                 buttons { Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
             }
