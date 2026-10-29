@@ -25,6 +25,11 @@ struct MenuCommands: Commands {
     @ObservedObject var model: ArchiveModel
 
     var body: some Commands {
+        CommandGroup(replacing: .appInfo) {
+            Button("About ArchiveX") {
+                AboutPanel.show()
+            }
+        }
         CommandGroup(replacing: .newItem) {
             Button("Open Archive…") { Panels.openArchive(model) }.keyboardShortcut("o")
             Button("New Archive…") { Panels.newArchive(model) }.keyboardShortcut("n")
@@ -83,5 +88,35 @@ struct MenuCommands: Commands {
             Button("Delete Selected from Archive (Delete)") { model.confirmDelete() }
                 .disabled(model.selection.isEmpty)
         }
+    }
+}
+
+enum AboutPanel {
+    @MainActor
+    static func show() {
+        let pStyle = NSMutableParagraphStyle()
+        pStyle.alignment = .center
+
+        let normalAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: pStyle
+        ]
+
+        let linkAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11),
+            .link: URL(string: "https://github.com/YashDayani/ArchiveX")!,
+            .paragraphStyle: pStyle
+        ]
+
+        let credits = NSMutableAttributedString()
+        credits.append(NSAttributedString(string: "Created by ", attributes: normalAttrs))
+        credits.append(NSAttributedString(string: "Yash Dayani", attributes: linkAttrs))
+        credits.append(NSAttributedString(string: "\n", attributes: normalAttrs))
+        credits.append(NSAttributedString(string: "github.com/YashDayani/ArchiveX", attributes: linkAttrs))
+
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .credits: credits
+        ])
     }
 }

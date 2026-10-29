@@ -7,7 +7,7 @@ import Security
 // The release workflow publishes ArchiveX.zip and SHA256SUMS. An update is only installed when the zip arrives over HTTPS from
 // GitHub, matches the checksum in SHA256SUMS, unpacks to an app with our bundle identifier and a valid code signature, and is
 // newer than the running version. The new app must also be signed by the same developer as the running one (its designated
-// requirement). If the running app is only ad-hoc signed there is no signer to pin, and if it cannot be replaced in place, the new
+// requirement when it has one (an ad-hoc signed app has no signer to pin). If the running app cannot be replaced in place, the new
 // app is revealed in Finder for the user to install by hand instead.
 
 struct UpdateOffer: Equatable {
@@ -71,7 +71,7 @@ final class Updater: ObservableObject {
     }
 
     static let shared = Updater()
-    static let autoCheckKey = "autoCheckUpdates", lastCheckKey = "lastUpdateCheck", skippedKey = "skippedUpdateVersion"
+    static let autoCheckKey = "autoCheckUpdates", skippedKey = "skippedUpdateVersion"
     static let assetName = "ArchiveX.zip", sumsName = "SHA256SUMS"
 
     @Published var state: State = .idle
@@ -89,10 +89,12 @@ final class Updater: ObservableObject {
 
     // MARK: Checking
 
-    /// Called at start-up: at most one quiet check a day, and only a new, not skipped version opens the sheet.
+    private var launchChecked = false
+
+    /// Called at start-up: every launch asks GitHub once, and only a new, not skipped version opens the sheet.
     func checkOnLaunch() {
-        guard defaults.object(forKey: Self.autoCheckKey) as? Bool ?? true else { return }
-        if let last = defaults.object(forKey: Self.lastCheckKey) as? Date, Date().timeIntervalSince(last) < 86_400 { return }
+        guard !launchChecked, defaults.object(forKey: Self.autoCheckKey) as? Bool ?? true else { return }
+        launchChecked = true
         Task { await check(manual: false) }
     }
 
@@ -106,7 +108,6 @@ final class Updater: ObservableObject {
         if manual { state = .checking }
         do {
             let offer = try await fetchLatest()
-            defaults.set(Date(), forKey: Self.lastCheckKey)
             guard let offer, let remote = AppVersion(offer.version), let local = AppVersion(currentVersion), remote > local else {
                 state = .upToDate; return
             }
@@ -196,11 +197,11 @@ final class Updater: ObservableObject {
         if trust == .mismatch {
             throw UpdateError.message("The new version is signed by a different developer than the one you have, so it was not installed.")
         }
-        if trust == .cannotPin || !Self.canReplace(appURL) {
+        // trust == .cannotPin: this copy is ad-hoc signed, so there is no signer to compare with; the checksum, bundle
+        // identifier, version and signature checks above still apply, and the update is installed in place.
+        if !Self.canReplace(appURL) {
             try? fm.removeItem(at: zip)
-            state = .revealed(newApp, trust == .cannotPin
-                ? "This copy of ArchiveX is not signed with a developer certificate, so the update cannot be checked against its signer. The new version is shown in Finder."
-                : "ArchiveX can’t replace itself where it is installed, so the new version is shown in Finder.")
+            state = .revealed(newApp, "ArchiveX can’t replace itself where it is installed, so the new version is shown in Finder.")
             NSWorkspace.shared.activateFileViewerSelecting([newApp])
             return
         }
@@ -302,21 +303,23 @@ final class Updater: ObservableObject {
     /// Waits for ArchiveX to quit, swaps the bundle (keeping the old one until the copy worked) and starts the new version.
     static let helperScript = """
     #!/bin/sh
-    pid="$1"; app="$2"; new="$3"
+    pid="$1"; app="$2"; new="$3"; work="$4"
     while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
     old="$app.old-$$"
     mv "$app" "$old" || { open "$app"; exit 1; }
     if ditto "$new" "$app"; then
-      rm -rf "$old" "$(dirname "$new")"
+      rm -rf "$old"
     else
       rm -rf "$app"; mv "$old" "$app"
     fi
+    rm -rf "$work"
     open "$app"
     """
 
     static func launchHelper(script: URL, newApp: URL) -> Bool {
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = [script.path, String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundleURL.path, newApp.path]
+        p.arguments = [script.path, String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundleURL.path, newApp.path,
+                       script.deletingLastPathComponent().path]
         p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
         return (try? p.run()) != nil
     }

@@ -149,12 +149,31 @@ func makeRelease(version: String, bundleID: String = "io.feedspace.archivex", in
     if case .failed(let m) = upd.state { check("a different signer is refused", m.contains("different developer") && handedOff == nil, m) } else { check("a different signer is refused", false, "\(upd.state)") }
     upd.checkSigner = { _ in .cannotPin }
     upd.state = .idle; upd.install(local)
+    for _ in 0..<200 { if case .failed = upd.state { break }; if handedOff != nil { break }; try? await Task.sleep(nanoseconds: 50_000_000) }
+    check("an ad-hoc running app (no signer to pin) still installs in place", handedOff?.lastPathComponent == "ArchiveX.app", "\(upd.state)")
+    // a read-only install location falls back to showing the new app in Finder
+    handedOff = nil; upd.checkSigner = { _ in .matches }
+    let savedApp = upd.appURL; upd.appURL = URL(fileURLWithPath: "/System/Applications/ArchiveX.app")
+    upd.state = .idle; upd.install(local)
     for _ in 0..<200 { if case .revealed = upd.state { break }; if case .failed = upd.state { break }; try? await Task.sleep(nanoseconds: 50_000_000) }
-    if case .revealed = upd.state { check("an unpinnable signer means manual install, not auto-install", handedOff == nil) } else { check("an unpinnable signer means manual install, not auto-install", false, "\(upd.state)") }
+    if case .revealed = upd.state { check("a read-only install location falls back to Finder", handedOff == nil) } else { check("a read-only install location falls back to Finder", false, "\(upd.state)") }
+    upd.appURL = savedApp
     let realTrust = Updater.signerTrust(of: good.appendingPathComponent("ArchiveX.app"))
     check("an ad-hoc running app cannot pin a signer (the real check)", realTrust == .cannotPin, "\(realTrust)")
     check("the swap script no longer strips quarantine", !Updater.helperScript.contains("quarantine"))
     upd.checkSigner = { _ in .matches }
+
+    // 6g. every launch checks, even right after an earlier check
+    let launch = Updater()
+    launch.defaults = UserDefaults(suiteName: "archivex-updater-test-\(UUID().uuidString)")!
+    launch.currentVersion = "1.0.0"; launch.releaseURL = feed
+    launch.checkOnLaunch()
+    for _ in 0..<100 { if case .available = launch.state { break }; try? await Task.sleep(nanoseconds: 50_000_000) }
+    if case .available = launch.state { check("the launch check finds the update", launch.sheetVisible) } else { check("the launch check finds the update", false, "\(launch.state)") }
+    let off = Updater(); off.defaults = UserDefaults(suiteName: "archivex-updater-test-\(UUID().uuidString)")!
+    off.defaults.set(false, forKey: Updater.autoCheckKey); off.currentVersion = "1.0.0"; off.releaseURL = feed
+    off.checkOnLaunch(); try? await Task.sleep(nanoseconds: 500_000_000)
+    check("the launch check respects the off switch", off.state == .idle)
 
     // 7. skipping a version silences quiet checks only
     upd.currentVersion = "1.0.0"; upd.releaseURL = feed; upd.state = .idle

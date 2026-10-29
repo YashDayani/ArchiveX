@@ -22,6 +22,7 @@ rm -rf build/slices
 
 sed "s/__VERSION__/$VERSION/g" Info.plist > "$APP/Contents/Info.plist"
 [ -f logo.svg ] && cp logo.svg "$APP/Contents/Resources/logo.svg"
+[ -f Credits.rtf ] && cp Credits.rtf "$APP/Contents/Resources/Credits.rtf"
 
 
 # App icon: Icon Composer file (Liquid Glass on macOS 26+, flat .icns on older systems), compiled by Xcode's actool.
