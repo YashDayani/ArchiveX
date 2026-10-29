@@ -3,15 +3,15 @@ import Foundation
 // The façade the app talks to. Every function here is synchronous and cancellable
 // (Task.checkCancellation), so the model runs them on a background task.
 
-enum AXKind { case zip, tar, gz, tgz, bz2, tbz2, xz, txz, sevenZ, rar, iso, cpio, ar, lzw, rpm, xar, cab, dmg }
+enum AXKind { case zip, tar, gz, tgz, bz2, tbz2, xz, txz, zst, tzst, sevenZ, rar, iso, cpio, ar, lzw, rpm, xar, cab, dmg }
 
 extension AXKind {
     /// kinds whose payload is one compressed stream
-    var isStream: Bool { self == .gz || self == .bz2 || self == .xz }
+    var isStream: Bool { self == .gz || self == .bz2 || self == .xz || self == .zst }
     /// kinds handled through the generic `ContainerArchive` layer
     var isContainer: Bool { self == .ar || self == .lzw || self == .rpm || self == .xar || self == .cab || self == .dmg }
     /// kinds that are a tar inside a compressor
-    var isCompressedTar: Bool { self == .tgz || self == .tbz2 || self == .txz }
+    var isCompressedTar: Bool { self == .tgz || self == .tbz2 || self == .txz || self == .tzst }
     var isTarLike: Bool { self == .tar || isCompressedTar }
 }
 
@@ -51,6 +51,8 @@ enum AXCore {
         if n.hasSuffix(".bz2") { return .bz2 }
         if n.hasSuffix(".tar.xz") || n.hasSuffix(".txz") { return .txz }
         if n.hasSuffix(".xz") { return .xz }
+        if n.hasSuffix(".tar.zst") || n.hasSuffix(".tzst") { return .tzst }
+        if n.hasSuffix(".zst") { return .zst }
         for e in [".zip", ".jar", ".cbz", ".apk", ".ipa", ".epub"] where n.hasSuffix(e) { return .zip }
         if n.hasSuffix(".7z") { return .sevenZ }
         if n.hasSuffix(".iso") { return .iso }
@@ -102,6 +104,7 @@ enum AXCore {
         case .tgz, .gz: return (try GzipSource(file: f), f)
         case .tbz2, .bz2: return (try Bzip2Source(file: f), f)
         case .txz, .xz: return (try XzSource(file: f), f)
+        case .tzst, .zst: return (try ZstdSource(file: f), f)
         default: return (FileSource(f), f)
         }
     }
@@ -128,11 +131,11 @@ enum AXCore {
             return try CpioArchive(url: url).listing
         case .ar, .lzw, .rpm, .xar, .cab, .dmg:
             return Container.listing(try container(url, k))
-        case .tar, .tgz, .tbz2, .txz:
+        case .tar, .tgz, .tbz2, .txz, .tzst:
             let (src, f) = try tarSource(url, k)
             let reader = TarReader(src)
             var l = Listing()
-            l.details = k == .tgz ? "TAR · gzip" : k == .tbz2 ? "TAR · bzip2" : k == .txz ? "TAR · xz" : "TAR"
+            l.details = k == .tgz ? "TAR · gzip" : k == .tbz2 ? "TAR · bzip2" : k == .txz ? "TAR · xz" : k == .tzst ? "TAR · Zstandard" : "TAR"
             while let e = try reader.next() {
                 try Task.checkCancellation()
                 try reader.skipData(e)
@@ -142,11 +145,11 @@ enum AXCore {
             }
             _ = f
             return l
-        case .bz2, .xz:
+        case .bz2, .xz, .zst:
             let f = try FileIn(url)
             _ = try decoded(url, k)
             var l = Listing()
-            l.details = k == .xz ? "xz" : "bzip2"
+            l.details = k == .xz ? "xz" : k == .zst ? "Zstandard" : "bzip2"
             let size = Int64(k == .xz ? (XzSource.recordedSize(of: f) ?? 0) : 0)
             l.entries = [ArchiveEntry(path: streamName(url, k, nil), isDir: false, size: size, packed: Int64(f.size),
                                       ratio: size > 0 ? "\(min(100, Int(Double(f.size) / Double(size) * 100)))%" : "", mtime: "",
@@ -199,7 +202,7 @@ enum AXCore {
             let z = try SevenZipArchive(url: url, password: password)
             let total = z.files.filter { !$0.isDir && ex.isSelected(SafePath.clean($0.name) ?? "") }.reduce(Int64(0)) { $0 + Int64($1.size) }
             try z.extract(to: ex, progress: ProgressTracker(total: total, report: progress))
-        case .tar, .tgz, .tbz2, .txz:
+        case .tar, .tgz, .tbz2, .txz, .tzst:
             let (src, f) = try tarSource(url, k)
             let reader = TarReader(src)
             let tracker = ProgressTracker(total: k == .tar ? Int64(f.size) : Int64(f.size) * 4, report: progress)
@@ -242,7 +245,7 @@ enum AXCore {
             }
             while !(try src.read(1 << 20)).isEmpty { try Task.checkCancellation() }       // verify the container's final checksums
             for (u, m, t) in dirs.reversed() { ex.finalize(u, mode: m, mtime: t) }
-        case .gz, .bz2, .xz:
+        case .gz, .bz2, .xz, .zst:
             let (g, f) = try decoded(url, k)
             let name = streamName(url, k, (g as? GzipSource)?.storedName)
             if let u = try ex.destination(for: name, isDir: false) {
@@ -283,14 +286,14 @@ enum AXCore {
         case .sevenZ:
             let z = try SevenZipArchive(url: url, password: password)
             try z.test(progress: ProgressTracker(total: z.files.reduce(Int64(0)) { $0 + Int64($1.size) }, report: progress))
-        case .tar, .tgz, .tbz2, .txz:
+        case .tar, .tgz, .tbz2, .txz, .tzst:
             let (src, f) = try tarSource(url, k)
             let reader = TarReader(src)
             let tracker = ProgressTracker(total: Int64(f.size) * (k == .tar ? 1 : 4), report: progress)
             let null = NullSink()
             while let e = try reader.next() { try Task.checkCancellation(); try reader.copyData(e, to: null, progress: tracker) }
             while !(try src.read(1 << 20)).isEmpty { try Task.checkCancellation() }       // run the container's final checksums
-        case .gz, .bz2, .xz:
+        case .gz, .bz2, .xz, .zst:
             let (g, _) = try decoded(url, k)
             while !(try g.read(1 << 20)).isEmpty { try Task.checkCancellation() }
         }

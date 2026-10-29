@@ -33,6 +33,7 @@ func sh(_ cmd: String, cwd: URL? = nil) -> (status: Int32, out: String) {
 
 func q(_ u: URL) -> String { "'" + u.path.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
+let ZSTD: String? = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"].first { FileManager.default.isExecutableFile(atPath: $0) }
 let aesPWArg = "-p\"$(printf 's3cret-\\xc3\\xa9')\""   // exact UTF-8 bytes; Process() would hand 7-Zip a decomposed é
 let aesPW = "s3cret-\u{e9}"     // NFC, spelled with an escape so editors cannot change it
 
@@ -996,7 +997,7 @@ do {
     let cpioNewc = pk.appendingPathComponent("payload.cpio")
     sh("/usr/bin/bsdtar --format newc -cf \(q(cpioNewc)) a.txt sub run.sh link-to-a empty-dir empty.txt", cwd: rpmSrc)
     let cpioRef = refExtract(cpioNewc, "rpm-cpio")
-    for (label, comp) in [("gzip", "gzip -c"), ("bzip2", "bzip2 -c"), ("xz", "xz7"), ("none", "cat")] {
+    for (label, comp) in [("gzip", "gzip -c"), ("bzip2", "bzip2 -c"), ("xz", "xz7"), ("none", "cat")] + (ZSTD != nil ? [("zstd", "\(ZSTD!) -q -c")] : []) {
         var payload: Data
         if comp == "xz7" {
             let x = pk.appendingPathComponent("payload.xz"); try? fm.removeItem(at: x)
@@ -1121,6 +1122,55 @@ do {
         let bad = work.appendingPathComponent("bad.dmg"); try d.write(to: bad)
         var det = false; do { try AXCore.test(bad, password: nil, progress: { _ in }) } catch { det = true }
         check("dmg: damaged image is detected", det)
+    }
+
+    // Zstandard files and tar.zst written by the zstd tool (levels, checksums, long windows)
+    if let Z = ZSTD {
+        let zs = work.appendingPathComponent("zst"); try fm.createDirectory(at: zs, withIntermediateDirectories: true)
+        try Data((1...400_000).map { "record \($0): \(["alpha", "beta", "gamma", "delta"][$0 % 4]) \($0 % 997)\n" }.joined().utf8).write(to: zs.appendingPathComponent("text.txt"))
+        try Data((0..<(1 << 20)).map { _ in UInt8.random(in: 0...255) }).write(to: zs.appendingPathComponent("noise.bin"))
+        try Data(contentsOf: URL(fileURLWithPath: "/usr/bin/ssh")).write(to: zs.appendingPathComponent("code.bin"))
+        try "tiny".write(to: zs.appendingPathComponent("tiny.txt"), atomically: true, encoding: .utf8)
+        try Data().write(to: zs.appendingPathComponent("empty.txt"))
+        for f in ["text.txt", "noise.bin", "code.bin", "tiny.txt", "empty.txt"] {
+            for opts in ["-1", "-3", "-9", "-19", "-3 --no-check", "--long=27 -15", "-1 --fast=5"] {
+                let z = zs.appendingPathComponent("\(f).\(opts.replacingOccurrences(of: " ", with: "")).zst")
+                sh("\(Z) -q -f \(opts) \(f) -o \(q(z))", cwd: zs)
+                do {
+                    let ours = try extractOurs(z, to: "own-zst-\(z.lastPathComponent)")
+                    let got = (try? Data(contentsOf: ours.appendingPathComponent(String(z.lastPathComponent.dropLast(4))))) ?? Data()
+                    check("zstd [\(f) \(opts)]: round trip", got == (try Data(contentsOf: zs.appendingPathComponent(f))), "\(got.count) bytes")
+                } catch { check("zstd [\(f) \(opts)]", false, "\(error)") }
+            }
+        }
+        // concatenated frames and a skippable frame in between
+        let cat = zs.appendingPathComponent("cat.zst")
+        sh("(\(Z) -q -c tiny.txt; printf '\\x50\\x2a\\x4d\\x18\\x04\\x00\\x00\\x00abcd'; \(Z) -q -c text.txt) > \(q(cat))", cwd: zs)
+        do {
+            let ours = try extractOurs(cat, to: "own-zst-cat")
+            let got = (try? Data(contentsOf: ours.appendingPathComponent("cat"))) ?? Data()
+            check("zstd: concatenated and skippable frames", got == (try Data("tiny".utf8) + Data(contentsOf: zs.appendingPathComponent("text.txt"))), "\(got.count)")
+        } catch { check("zstd: concatenated frames", false, "\(error)") }
+        // tar.zst
+        let tz = zs.appendingPathComponent("t.tar.zst")
+        sh("/usr/bin/bsdtar -cf - a.txt sub run.sh link-to-a empty-dir empty.txt | \(Z) -q -f -o \(q(tz))", cwd: src)
+        let tref = work.appendingPathComponent("zst-tar-ref"); try fm.createDirectory(at: tref, withIntermediateDirectories: true)
+        sh("\(Z) -dc \(q(tz)) | /usr/bin/bsdtar -xf - -C \(q(tref))")
+        do {
+            let ours = try extractOurs(tz, to: "own-tarzst")
+            check("tar.zst: matches bsdtar's extraction", sameTree(tref, ours) == nil, sameTree(tref, ours) ?? "")
+            let l = try AXCore.list(tz, password: nil)
+            check("tar.zst: listing", l.details.contains("Zstandard") && l.entries.contains { $0.path == "sub/b.txt" }, l.details)
+        } catch { check("tar.zst", false, "\(error)") }
+        // damaged data must be detected (checksum or structure)
+        var zb = try Data(contentsOf: zs.appendingPathComponent("text.txt.-3.zst")); zb[zb.count / 2] ^= 0x41
+        let zbad = work.appendingPathComponent("bad.zst"); try zb.write(to: zbad)
+        var zdet = false; do { try AXCore.test(zbad, password: nil, progress: { _ in }) } catch { zdet = true }
+        check("zstd: damaged data is detected", zdet)
+        var zt = try Data(contentsOf: zs.appendingPathComponent("text.txt.-3.zst")); zt.removeLast(2000)
+        let ztr = work.appendingPathComponent("trunc.zst"); try zt.write(to: ztr)
+        var zdet2 = false; do { try AXCore.test(ztr, password: nil, progress: { _ in }) } catch { zdet2 = true }
+        check("zstd: truncated data is detected", zdet2)
     }
 } catch { check("section 12 threw", false, "\(error)") }
 

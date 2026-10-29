@@ -7,6 +7,7 @@ they are not part of the app, are not in this repository, and are not needed to 
 |---|---|
 | 7-Zip (`7zz`) — <https://www.7-zip.org> | 7z, ZIP (AES), XZ, BZ2, TAR; BCJ / ARM64 / ARM / Delta filters |
 | RARLAB `rar` and `unrar` — <https://www.rarlab.com> | creating and extracting RAR 5 archives |
+| `zstd` (optional, e.g. from Homebrew) | Zstandard files, tar.zst and zstd-compressed RPM payloads |
 | macOS `unzip`, `zip`, `tar` (bsdtar), `gzip`, `bzip2`, `hdiutil` | ZIP, TAR, GZ, BZ2, XZ, CPIO, ISO |
 
 ## Engine tests (`CoreTests`)

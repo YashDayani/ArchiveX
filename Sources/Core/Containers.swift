@@ -325,7 +325,7 @@ final class RpmArchive: ContainerArchive {
         if magic.starts(with: [0x1f, 0x8b]) { src = try GzipSource(file: payload); details += " · gzip" }
         else if magic.starts(with: [0x42, 0x5a, 0x68]) { src = try Bzip2Source(file: payload); details += " · bzip2" }
         else if magic.starts(with: [0xfd, 0x37, 0x7a, 0x58, 0x5a]) { src = try XzSource(file: payload); details += " · xz" }
-        else if magic.starts(with: [0x28, 0xb5, 0x2f, 0xfd]) { throw AXError.unsupported("RPM packages compressed with zstd") }
+        else if magic.starts(with: [0x28, 0xb5, 0x2f, 0xfd]) { src = try ZstdSource(file: payload); details += " · zstd" }
         else if magic.starts(with: [0x30, 0x37, 0x30, 0x37]) { src = FileSource(payload) }
         else { throw AXError.unsupported("this RPM payload format") }
         let out = try FileOut(tmp)
