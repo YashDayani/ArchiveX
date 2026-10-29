@@ -48,11 +48,16 @@
 | **GZ · BZ2 · XZ** single files | ✅ | — | — |
 | **ISO 9660** (Joliet, Rock Ridge) | ✅ | — | — |
 | **CPIO** (newc, odc) | ✅ | — | — |
+| **DMG** disk images (zlib, bzip2, LZFSE, LZMA, raw; Apple/GPT/no partition map) with **HFS+** volumes | ✅ | — | — |
+| **PKG / XAR** (macOS installer packages) | ✅ | — | — |
+| **DEB · AR · RPM** (gzip / bzip2 / xz payloads) | ✅ | — | — |
+| **CAB** (stored, MSZIP) · **.Z** (compress) | ✅ | — | — |
 
 ¹ RARLAB's license reserves the RAR compression algorithm, so ArchiveX can read RAR but will never create it.
 
-**Not supported (yet):** RAR 1.x / 2.x (pre-2000 archives), multi-volume RAR 5, DMG, CAB, WIM, XAR, ARJ, LZH,
-Info-ZIP style `.z01` spanned ZIPs, ZIP archives that use PPMd. ArchiveX tells you plainly when it meets one of these.
+**Not supported (yet):** RAR 1.x / 2.x (pre-2000 archives), multi-volume RAR 5, DMG images that hold **APFS** volumes
+(or HFS+ files with transparent compression), CAB files using LZX or Quantum, RPM packages compressed with zstd, WIM, ARJ,
+LZH, Info-ZIP style `.z01` spanned ZIPs, ZIP archives that use PPMd. ArchiveX tells you plainly when it meets one of these.
 
 ## Install
 

@@ -1075,6 +1075,53 @@ do {
             try AXCore.test(c, password: nil, progress: { _ in })
         } catch { check("cab [\(mszip ? "MSZIP" : "stored")]", false, "\(error)") }
     }
+
+    // DMG disk images made by hdiutil (HFS+ inside), in several compressions and partition layouts
+    let dmgSrc = work.appendingPathComponent("dmg-src"); try fm.createDirectory(at: dmgSrc, withIntermediateDirectories: true)
+    sh("cp -R sub a.txt run.sh empty.txt empty-dir link-to-a 'résumé 日本語 ✓.txt' \(q(dmgSrc))/", cwd: src)
+    try fm.createDirectory(at: dmgSrc.appendingPathComponent("Deep Folder/Another Level"), withIntermediateDirectories: true)
+    try Data((0..<1_500_000).map { _ in UInt8.random(in: 0...255) }).write(to: dmgSrc.appendingPathComponent("Deep Folder/random.bin"))
+    try Data((1...120_000).map { "dmg line \($0) alpha beta gamma\n" }.joined().utf8).write(to: dmgSrc.appendingPathComponent("Deep Folder/Another Level/text.txt"))
+    sh("ln -f \(q(dmgSrc.appendingPathComponent("a.txt"))) \(q(dmgSrc.appendingPathComponent("hardlink-to-a.txt")))")
+    let dmgDir = work.appendingPathComponent("dmgs"); try fm.createDirectory(at: dmgDir, withIntermediateDirectories: true)
+    var dmgRef: URL?
+    for (label, fmt, layout) in [("UDZO", "UDZO", "SPUD"), ("UDRO", "UDRO", "SPUD"), ("UDBZ", "UDBZ", "SPUD"), ("ULFO", "ULFO", "SPUD"), ("ULMO", "ULMO", "SPUD"),
+                                 ("GPT layout", "UDZO", "GPTSPUD"), ("no partition map", "UDZO", "NONE")] {
+        let out = dmgDir.appendingPathComponent("t-\(label.replacingOccurrences(of: " ", with: "_")).dmg")
+        let mk = sh("/usr/bin/hdiutil create -quiet -srcfolder \(q(dmgSrc)) -fs HFS+ -volname DMGTEST -format \(fmt) -layout \(layout) \(q(out))")
+        if mk.status != 0 { check("dmg [\(label)]: created by hdiutil", false, mk.out.suffix(160).description); continue }
+        if dmgRef == nil {
+            // reference: let macOS mount the same image read-only and copy what it shows
+            let mnt = work.appendingPathComponent("dmg-mount"); try fm.createDirectory(at: mnt, withIntermediateDirectories: true)
+            if sh("/usr/bin/hdiutil attach -quiet -readonly -nobrowse -noverify -mountpoint \(q(mnt)) \(q(out))").status == 0 {
+                let r = work.appendingPathComponent("dmg-ref"); sh("/bin/cp -R \(q(mnt))/. \(q(r))/ 2>/dev/null; true")
+                try? fm.createDirectory(at: r, withIntermediateDirectories: true)
+                sh("/bin/cp -R \(q(mnt))/ \(q(r))/")
+                sh("/usr/bin/hdiutil detach -quiet -force \(q(mnt))")
+                dmgRef = r
+            }
+        }
+        do {
+            let ours = try extractOurs(out, to: "own-dmg-\(label.replacingOccurrences(of: " ", with: "_"))")
+            if let r = dmgRef { check("dmg [\(label)]: matches what macOS mounts", sameContent(r, ours) == nil, sameContent(r, ours) ?? "") }
+            check("dmg [\(label)]: bytes equal the source files", (try? Data(contentsOf: ours.appendingPathComponent("Deep Folder/random.bin"))) == (try? Data(contentsOf: dmgSrc.appendingPathComponent("Deep Folder/random.bin")))
+                  && (try? Data(contentsOf: ours.appendingPathComponent("hardlink-to-a.txt"))) == (try? Data(contentsOf: dmgSrc.appendingPathComponent("a.txt"))))
+            try AXCore.test(out, password: nil, progress: { _ in })
+            if label == "UDZO" { let l = try AXCore.list(out, password: nil); check("dmg: listing names the volume and format", l.details.contains("DMGTEST") && l.details.contains("zlib") && l.entries.contains { $0.path == "Deep Folder/Another Level/text.txt" }, l.details) }
+        } catch { check("dmg [\(label)]", false, "\(error)") }
+    }
+    // an APFS image is recognised and refused with a clear message
+    let apfsDmg = dmgDir.appendingPathComponent("t-apfs.dmg")
+    if sh("/usr/bin/hdiutil create -quiet -srcfolder \(q(dmgSrc)) -fs APFS -volname APFSTEST -format UDZO \(q(apfsDmg))").status == 0 {
+        do { _ = try AXCore.list(apfsDmg, password: nil); check("dmg [APFS]: reported as unsupported", false) }
+        catch AXError.unsupported(let m) { check("dmg [APFS]: reported as unsupported", m.contains("APFS"), m) } catch { check("dmg [APFS]: reported as unsupported", false, "\(error)") }
+    }
+    if let anyDmg = (try? fm.contentsOfDirectory(atPath: dmgDir.path))?.first(where: { $0.hasPrefix("t-UDZO") }) {
+        var d = try Data(contentsOf: dmgDir.appendingPathComponent(anyDmg)); d.removeSubrange(d.count / 3..<d.count / 3 + 4000)
+        let bad = work.appendingPathComponent("bad.dmg"); try d.write(to: bad)
+        var det = false; do { try AXCore.test(bad, password: nil, progress: { _ in }) } catch { det = true }
+        check("dmg: damaged image is detected", det)
+    }
 } catch { check("section 12 threw", false, "\(error)") }
 
 print("\nRESULT: \(passed) passed, \(failed) failed")

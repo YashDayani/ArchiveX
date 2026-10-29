@@ -23,6 +23,7 @@
       <array>
         <string>zip</string><string>7z</string><string>rar</string><string>tar</string><string>gz</string><string>tgz</string>
         <string>bz2</string><string>tbz2</string><string>xz</string><string>txz</string><string>iso</string><string>cpio</string>
+        <string>deb</string><string>rpm</string><string>xar</string><string>pkg</string><string>cab</string><string>dmg</string><string>Z</string><string>ar</string>
       </array>
     </dict>
   </array>
