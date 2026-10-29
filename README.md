@@ -62,6 +62,18 @@ ZIP archives that use PPMd. ArchiveX tells you plainly when it meets one of thes
 
 ## Install
 
+**Easiest — one paste, no warning.** In Terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YashDayani/ArchiveX/main/install.sh | sh
+```
+
+It downloads the latest release with `curl`, checks it against the published SHA-256, puts ArchiveX in `/Applications` and opens it.
+Downloads made by `curl` are not flagged as "from the internet", so macOS opens the app right away. Updates from inside ArchiveX
+(**Check for Updates…**) are downloaded the same way, so they never show the warning either. Run the same line again any time to reinstall.
+
+**Or by hand:**
+
 1. Download **ArchiveX.zip** from the [Releases](../../releases) page and unzip it.
 2. Drag **ArchiveX.app** into `/Applications`.
 3. **First launch.** ArchiveX is not notarized by Apple yet (that needs a paid Apple Developer ID), so macOS shows
