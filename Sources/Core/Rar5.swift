@@ -490,14 +490,30 @@ final class RarArchive {
         let head = try file.read(at: 0, 8)
         if Array(head.prefix(7)) == RarArchive.signature4 { generation = 4; try parse4(); return }
         guard Array(head) == RarArchive.signature5 else { throw AXError.corrupt("not a RAR 5 archive") }
+        if let first = RarArchive.firstVolumeURL(file.url), first != file.url, FileManager.default.fileExists(atPath: first.path),
+           Array((try? FileIn(first).read(at: 0, 8)) ?? Data()) == RarArchive.signature5 { file = try FileIn(first) }       // opened a later volume
+        var vol = file
+        var cont = try parse5(vol)
+        while cont {
+            guard let next = RarArchive.nextVolumeURL(vol.url, newNumbering: true), FileManager.default.fileExists(atPath: next.path) else { break }
+            vol = try FileIn(next)
+            guard Array(try vol.read(at: 0, 8)) == RarArchive.signature5 else { throw AXError.corrupt("“\(next.lastPathComponent)” is not a RAR 5 volume") }
+            volumeCount += 1
+            cont = try parse5(vol)
+        }
+    }
+
+    /// Reads the blocks of one volume; returns true when the archive continues in a following volume.
+    private func parse5(_ f: FileIn) throws -> Bool {
         var pos: UInt64 = 8
         var headerKey: Data?
-        while pos + 7 <= file.size {
+        var continues = false
+        while pos + 7 <= f.size {
             var h: Data
             var next: UInt64
             if let key = headerKey {
-                let iv = try file.readExactly(at: pos, 16)
-                let first = try file.readExactly(at: pos + 16, 16)
+                let iv = try f.readExactly(at: pos, 16)
+                let first = try f.readExactly(at: pos + 16, 16)
                 // decrypt the first block to learn the size, then the rest, all in one CBC chain
                 var cryptor: CCCryptorRef?
                 let st = key.withUnsafeBytes { k in iv.withUnsafeBytes { v in CCCryptorCreate(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), 0, k.baseAddress, 32, v.baseAddress, &cryptor) } }
@@ -514,19 +530,19 @@ final class RarArchive {
                 let hs = Int(try r.vint())
                 let total = r.p + hs
                 let enc = (total + 15) / 16 * 16
-                guard hs < 1 << 21, pos + 16 + UInt64(enc) <= file.size else { throw AXError.wrongPassword }
-                if enc > 16 { plain.append(try dec(try file.readExactly(at: pos + 32, enc - 16))) }
+                guard hs < 1 << 21, pos + 16 + UInt64(enc) <= f.size else { throw AXError.wrongPassword }
+                if enc > 16 { plain.append(try dec(try f.readExactly(at: pos + 32, enc - 16))) }
                 h = plain.prefix(total)
                 next = pos + 16 + UInt64(enc)
                 guard CRC32.update(0, h.suffix(from: h.startIndex + 4)) == h.le32(0) else { throw AXError.wrongPassword }
             } else {
-                let probe = try file.read(at: pos, 16)
+                let probe = try f.read(at: pos, 16)
                 guard probe.count >= 8 else { break }
                 var r = RarVint(probe); r.p = 4
                 let hs = Int(try r.vint())
                 let total = r.p + hs
-                guard hs > 0, hs < 1 << 21, pos + UInt64(total) <= file.size else { throw AXError.corrupt("truncated RAR header") }
-                h = try file.readExactly(at: pos, total)
+                guard hs > 0, hs < 1 << 21, pos + UInt64(total) <= f.size else { throw AXError.corrupt("truncated RAR header") }
+                h = try f.readExactly(at: pos, total)
                 next = pos + UInt64(total)
                 guard CRC32.update(0, h.suffix(from: h.startIndex + 4)) == h.le32(0) else { throw AXError.corrupt("RAR header CRC mismatch") }
             }
@@ -544,7 +560,6 @@ final class RarArchive {
             case 1:                                                    // main header
                 let af = try r.vint()
                 isSolid = af & 4 != 0
-                if af & 1 != 0 { throw AXError.unsupported("multi-volume RAR archives") }
             case 4:                                                    // archive encryption header
                 let e = try parseEnc(&r, extra: false)
                 let keys = try derive(salt: e.salt, log2: e.log2)
@@ -569,7 +584,7 @@ final class RarArchive {
                 ent.name = String(decoding: try r.bytes(nl), as: UTF8.self)
                 ent.packSize = dataSize
                 ent.dataOffset = dataOffset
-                guard dataOffset + dataSize <= file.size else { throw AXError.corrupt("RAR archive is truncated (data of “\(ent.name)” is incomplete)") }
+                guard dataOffset + dataSize <= f.size else { throw AXError.corrupt("RAR archive is truncated (data of “\(ent.name)” is incomplete)") }
                 // extra records
                 var ex = RarVint(h); ex.p = bodyEnd - extraSize
                 while ex.p < bodyEnd {
@@ -591,14 +606,30 @@ final class RarArchive {
                     }
                     ex.p = start + sz
                 }
-                if type == 2 { entries.append(ent) }
+                ent.parts = [RarPart(file: f, offset: dataOffset, length: dataSize)]
+                if type == 2 {
+                    let splitBefore = flags & 8 != 0, splitAfter = flags & 0x10 != 0
+                    if splitBefore, let li = entries.indices.last, entries[li].name == ent.name, entries[li].incomplete {
+                        entries[li].parts.append(contentsOf: ent.parts)
+                        entries[li].packSize += dataSize
+                        entries[li].incomplete = splitAfter
+                        if !splitAfter { entries[li].crc = ent.crc; entries[li].enc?.useMAC = ent.enc?.useMAC ?? false }      // the whole-file checksum (and its MAC flag) comes with the last piece
+                    } else {
+                        ent.incomplete = splitAfter
+                        if splitAfter { ent.crc = nil }
+                        entries.append(ent)
+                    }
+                }
             case 5:
-                pos = file.size; continue
+                let ef = r.p < bodyEnd ? try r.vint() : 0
+                continues = ef & 1 != 0
+                pos = f.size; continue
             default: break
             }
             pos = next + dataSize
             if flags & 4 == 0 && type > 5 { /* unknown required block: ignore */ }
         }
+        return continues
     }
 
     // MARK: public API

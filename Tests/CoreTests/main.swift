@@ -707,15 +707,15 @@ if CommandLine.arguments.count > 3 {
             if r.status != 0 { print("   (rar failed: \(r.out.suffix(120)))") }
             return a
         }
-        func check5(_ label: String, _ a: URL, pw: String? = nil, ref refSrc: URL? = nil) {
+        func check5(_ label: String, _ a: URL, pw: String? = nil, ref refSrc: URL? = nil, openAs: URL? = nil) {
             let refDir = work.appendingPathComponent("rref-\(label.replacingOccurrences(of: " ", with: "_"))")
             try? fm.createDirectory(at: refDir, withIntermediateDirectories: true)
             let pwArg = pw != nil ? "-p\(rarPW)" : "-p-"
             sh("\(UNRAR) x -y -o+ \(pwArg) \(q(a)) \(q(refDir))/")
             do {
-                let ours = try extractOurs(a, to: "rown-\(label.replacingOccurrences(of: " ", with: "_"))", password: pw)
+                let ours = try extractOurs(openAs ?? a, to: "rown-\(label.replacingOccurrences(of: " ", with: "_"))", password: pw)
                 check("rar5 [\(label)]: matches unrar's extraction", sameTree(refDir, ours) == nil, sameTree(refDir, ours) ?? "")
-                try AXCore.test(a, password: pw, progress: { _ in })
+                try AXCore.test(openAs ?? a, password: pw, progress: { _ in })
                 check("rar5 [\(label)]: integrity test passes", true)
             } catch { check("rar5 [\(label)]", false, "\(error)") }
         }
@@ -756,6 +756,23 @@ if CommandLine.arguments.count > 3 {
         // listing
         let l = try AXCore.list(rdir.appendingPathComponent("t-m3.rar"), password: nil)
         check("rar5 listing: names, sizes and folders", l.entries.contains { $0.path == "sub/b.txt" && $0.size == 6 } && l.entries.contains { $0.isDir && $0.path == "empty-dir" } && l.details.hasPrefix("RAR 5"), "\(l.details) \(l.entries.map(\.path).prefix(4))")
+        // multi-volume RAR 5 sets (.part1.rar, .part2.rar, …), plain, solid and encrypted
+        for (label, opts) in [("plain", "-m3"), ("solid", "-m5 -s"), ("store", "-m0"), ("encrypted", "-m3 -p\(rarPW)"), ("encrypted names", "-m3 -hp\(rarPW)")] {
+            let vd = rdir.appendingPathComponent("vol5-\(label.replacingOccurrences(of: " ", with: "_"))"); try fm.createDirectory(at: vd, withIntermediateDirectories: true)
+            sh("\(RAR) a -inul -ep1 \(opts) -v400k \(q(vd.appendingPathComponent("v.rar"))) big.txt noise.bin code.exe tone.wav", cwd: big)
+            let parts = ((try? fm.contentsOfDirectory(atPath: vd.path)) ?? []).filter { $0.hasSuffix(".rar") }.sorted()
+            check("rar5 volumes [\(label)]: the set was created", parts.count >= 3, "\(parts)")
+            guard let first = parts.first else { continue }
+            let pw: String? = label.hasPrefix("encrypted") ? aesPW : nil
+            check5("multi-volume \(label)", vd.appendingPathComponent(first), pw: pw)
+            if label == "plain", parts.count > 2 {
+                check5("multi-volume plain, opened from a later volume", vd.appendingPathComponent(first), openAs: vd.appendingPathComponent(parts[2]))
+                let gone = vd.appendingPathComponent(parts[1]); let kept = try Data(contentsOf: gone); try fm.removeItem(at: gone)
+                var failed = false; do { try AXCore.test(vd.appendingPathComponent(first), password: nil, progress: { _ in }) } catch { failed = true }
+                check("rar5 volumes: a missing volume is reported", failed)
+                try kept.write(to: gone)
+            }
+        }
         // corruption / truncation
         var rb = try Data(contentsOf: rdir.appendingPathComponent("b-big_mixed_m3.rar")); rb[rb.count / 2] ^= 0x33
         let bad = work.appendingPathComponent("bad.rar"); try rb.write(to: bad)
