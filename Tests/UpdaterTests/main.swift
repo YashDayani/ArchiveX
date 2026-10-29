@@ -183,6 +183,24 @@ func makeRelease(version: String, bundleID: String = "io.feedspace.archivex", in
     await upd.check(manual: true)
     if case .available = upd.state { check("a manual check still offers it", true) } else { check("a manual check still offers it", false, "\(upd.state)") }
 
+    // 8. release notes shown in the sheet
+    let gh = """
+    ## What's Changed
+    * Add search and Quick Look by @YashDayani in https://github.com/YashDayani/ArchiveX/pull/3
+    * Fix [crash](https://github.com/a/b/issues/1) on open in https://github.com/a/b/pull/4
+    ## New Contributors
+    * @someone made their first contribution in https://github.com/a/b/pull/5
+
+    **Full Changelog**: https://github.com/YashDayani/ArchiveX/compare/v1.1.1...v1.2.0
+    """
+    check("GitHub-generated notes lose links, credits, contributors and the changelog line",
+          ReleaseNotes.parse(gh) == [.bullet("Add search and Quick Look"), .bullet("Fix crash on open")], "\(ReleaseNotes.parse(gh))")
+    check("a notes body that is only the changelog link is empty", ReleaseNotes.parse("**Full Changelog**: https://github.com/a/b/compare/v1...v2").isEmpty)
+    let ours = "## What's new\n\n### Add updates\n- Checks on every launch\n- Installs **in place**\n\n- A plain change\n\n**Full Changelog**: https://x"
+    check("our notes keep headings and bullets",
+          ReleaseNotes.parse(ours) == [.heading("Add updates"), .bullet("Checks on every launch"), .bullet("Installs **in place**"), .bullet("A plain change")], "\(ReleaseNotes.parse(ours))")
+    check("no URL is left in any line", !ReleaseNotes.parse(gh + ours).contains { if case .bullet(let s) = $0 { return s.contains("http") } else { return false } })
+
     print("\n\(pass) passed, \(fail) failed")
     exit(fail == 0 ? 0 : 1)
 }

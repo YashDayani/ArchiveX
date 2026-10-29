@@ -51,6 +51,51 @@ struct AppVersion: Comparable, Equatable {
     static func == (a: AppVersion, b: AppVersion) -> Bool { !(a < b) && !(b < a) }
 }
 
+/// Turns a GitHub release body into what the update sheet shows: headings, bullets and plain lines, without links, "by @user in <url>"
+/// credits, the "Full Changelog" line or the "New Contributors" list.
+enum ReleaseNotes {
+    enum Line: Equatable { case heading(String), bullet(String), text(String) }
+
+    static func parse(_ markdown: String) -> [Line] {
+        var out: [Line] = []
+        var skipping = false
+        for raw in markdown.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n") {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { continue }
+            if t.hasPrefix("#") {
+                let title = clean(String(t.drop(while: { $0 == "#" })))
+                let lower = title.lowercased().replacingOccurrences(of: "’", with: "'")
+                skipping = lower.contains("new contributor")
+                if skipping || title.isEmpty || lower == "what's changed" || lower == "what's new" { continue }
+                out.append(.heading(title)); continue
+            }
+            if skipping { continue }
+            let lower = t.lowercased().replacingOccurrences(of: "*", with: "")
+            if lower.hasPrefix("full changelog") { continue }
+            if t.hasPrefix("- ") || t.hasPrefix("* ") || t.hasPrefix("+ ") {
+                let s = clean(String(t.dropFirst(2)))
+                if !s.isEmpty { out.append(.bullet(s)) }
+                continue
+            }
+            let s = clean(t)
+            if !s.isEmpty { out.append(.text(s)) }
+        }
+        return out
+    }
+
+    static func clean(_ text: String) -> String {
+        var r = text
+        func sub(_ pattern: String, _ with: String) { r = r.replacingOccurrences(of: pattern, with: with, options: .regularExpression) }
+        sub(#"\[([^\]]+)\]\([^)]*\)"#, "$1")                  // [text](url) -> text
+        sub(#"\s+by\s+@[\w-]+(\s+in\s+\S+)?"#, "")            // " by @user in https://…"
+        sub(#"\s+in\s+https?://\S+"#, "")
+        sub(#"https?://\S+"#, "")
+        sub(#"\(\s*\)"#, "")
+        sub(#"\s+"#, " ")
+        return r.trimmingCharacters(in: .whitespaces)
+    }
+}
+
 enum SignerTrust { case matches, cannotPin, mismatch }
 
 enum UpdateError: LocalizedError {

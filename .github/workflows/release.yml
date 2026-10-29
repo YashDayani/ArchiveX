@@ -119,6 +119,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: refs/tags/${{ needs.tag.outputs.tag || github.ref_name }}
+          fetch-depth: 0        # the release notes are written from the commits since the previous tag
 
       - name: Show toolchain
         run: |
@@ -172,9 +173,12 @@ jobs:
         with:
           subject-path: ArchiveX.zip
 
+      - name: Write release notes
+        run: python3 .github/scripts/release_notes.py "$TAG" > "$RUNNER_TEMP/notes.md"
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$TAG" ArchiveX.zip SHA256SUMS \
-            --title "ArchiveX $TAG" --generate-notes --verify-tag
+            --title "ArchiveX $TAG" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag

@@ -443,63 +443,127 @@ struct HashSheet: View {
 
 struct UpdateSheet: View {
     @ObservedObject private var updater = Updater.shared
+    @State private var notesHeight: CGFloat = 0
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 0) {
             switch updater.state {
             case .idle, .checking:
-                HStack(spacing: 10) { ProgressView().controlSize(.small); Text("Checking for updates…") }
-                buttons { Button("Cancel") { updater.dismiss() }.keyboardShortcut(.cancelAction) }
+                header("Checking for updates…", "Asking GitHub for the latest release.", spinner: true)
+                footer { Spacer(); Button("Cancel") { updater.dismiss() }.keyboardShortcut(.cancelAction) }
             case .upToDate:
-                Text("ArchiveX is up to date").font(.title3.weight(.semibold))
-                Text("You have the latest version (\(updater.currentVersion)).").foregroundStyle(.secondary)
-                buttons { Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
+                header("ArchiveX is up to date", "You have the latest version, \(updater.currentVersion).", badge: "checkmark.circle.fill", tint: .green)
+                footer { Spacer(); Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
             case .available(let offer):
-                Text("ArchiveX \(offer.version) is available").font(.title3.weight(.semibold))
-                Text("You have \(updater.currentVersion). Download size: \(ByteCountFormatter.string(fromByteCount: offer.size, countStyle: .file)).")
-                    .foregroundStyle(.secondary)
-                ScrollView {
-                    Text(Self.notes(offer.notes)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
-                }
-                .frame(height: 170).padding(8)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
-                buttons {
-                    Button("Release Page") { NSWorkspace.shared.open(offer.pageURL) }
+                header("A new version of ArchiveX is available",
+                       "ArchiveX \(offer.version) is ready to install. You have \(updater.currentVersion) · \(ByteCountFormatter.string(fromByteCount: offer.size, countStyle: .file)) download.")
+                Divider()
+                changelog(offer)
+                Divider()
+                footer {
+                    Button("Release Page") { NSWorkspace.shared.open(offer.pageURL) }.buttonStyle(.link)
                     Spacer()
                     Button("Skip This Version") { updater.skip(offer) }
                     Button("Later") { updater.dismiss() }.keyboardShortcut(.cancelAction)
-                    Button("Install Update") { updater.install(offer) }.keyboardShortcut(.defaultAction)
+                    Button("Install & Restart") { updater.install(offer) }.keyboardShortcut(.defaultAction)
                 }
             case .working(let text, let fraction):
-                Text("Updating ArchiveX").font(.title3.weight(.semibold))
-                if let fraction { ProgressView(value: fraction) } else { ProgressView().progressViewStyle(.linear) }
-                Text(text).foregroundStyle(.secondary).font(.callout)
+                header("Updating ArchiveX", text)
+                VStack(alignment: .leading, spacing: 8) {
+                    if let fraction {
+                        ProgressView(value: fraction)
+                        Text("\(Int(fraction * 100))%").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                    } else {
+                        ProgressView().progressViewStyle(.linear)
+                    }
+                    Text("ArchiveX restarts by itself when this is done. Your open archive is not changed.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 24).padding(.bottom, 24)
             case .failed(let message):
-                Label("Couldn’t update", systemImage: "exclamationmark.triangle").font(.title3.weight(.semibold))
-                Text(message).fixedSize(horizontal: false, vertical: true)
-                buttons { Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
-            case .revealed(_, let why):
-                Text("The new version is ready").font(.title3.weight(.semibold))
-                Text("\(why) Quit ArchiveX and drag the new app over the old one (for example into Applications).")
-                    .fixedSize(horizontal: false, vertical: true)
-                buttons { Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
+                header("The update didn’t finish", message, badge: "exclamationmark.triangle.fill", tint: .orange)
+                footer { Spacer(); Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
+            case .revealed:
+                header("The new version is ready", "ArchiveX can’t replace itself where it is installed, so the new version is shown in Finder. Quit ArchiveX and drag the new app over the old one (for example into Applications).",
+                       badge: "folder.fill", tint: .blue)
+                footer { Spacer(); Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
             }
         }
-        .padding(20).frame(width: 460)
+        .frame(width: 500)
     }
 
-    private func buttons<C: View>(@ViewBuilder _ content: () -> C) -> some View { HStack { content() }.padding(.top, 4) }
+    // MARK: pieces
 
-    /// Release notes are GitHub Markdown; headings become bold lines and list markers become bullets, the rest keeps its inline styling.
-    private static func notes(_ markdown: String) -> AttributedString {
-        let lines = markdown.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n").map { line -> String in
-            let t = line.trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("#") { return "**" + t.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces) + "**" }
-            if t.hasPrefix("- ") || t.hasPrefix("* ") { return "•  " + t.dropFirst(2) }
-            return line
+    private func header(_ title: String, _ subtitle: String?, badge: String? = nil, tint: Color = .accentColor, spinner: Bool = false) -> some View {
+        HStack(alignment: .top, spacing: 16) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable().frame(width: 60, height: 60)
+                .overlay(alignment: .bottomTrailing) {
+                    if let badge {
+                        Image(systemName: badge).font(.system(size: 22)).foregroundStyle(tint)
+                            .background(Circle().fill(Color(nsColor: .windowBackgroundColor)).padding(2))
+                            .offset(x: 6, y: 6)
+                    }
+                }
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Text(title).font(.title3.weight(.semibold))
+                    if spinner { ProgressView().controlSize(.small) }
+                }
+                if let subtitle {
+                    Text(subtitle).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 0)
         }
-        let text = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        let source = text.isEmpty ? "No release notes." : text
-        return (try? AttributedString(markdown: source, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(source)
+        .padding(24)
     }
+
+    private func footer<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        HStack(spacing: 10) { content() }.padding(.horizontal, 24).padding(.vertical, 16)
+    }
+
+    private func changelog(_ offer: UpdateOffer) -> some View {
+        let lines = ReleaseNotes.parse(offer.notes)
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("What’s new in \(offer.version)").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    if lines.isEmpty {
+                        Text("Bug fixes and improvements.").foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in row(line) }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(GeometryReader { Color.clear.preference(key: NotesHeightKey.self, value: $0.size.height) })
+            }
+            .frame(height: min(max(notesHeight, 40), 230))
+            .onPreferenceChange(NotesHeightKey.self) { notesHeight = $0 }
+        }
+        .padding(.horizontal, 24).padding(.vertical, 16)
+    }
+
+    @ViewBuilder private func row(_ line: ReleaseNotes.Line) -> some View {
+        switch line {
+        case .heading(let t):
+            Text(Self.inline(t)).font(.callout.weight(.semibold)).padding(.top, 6)
+        case .bullet(let t):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("•").foregroundStyle(.secondary)
+                Text(Self.inline(t)).fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.callout)
+        case .text(let t):
+            Text(Self.inline(t)).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private static func inline(_ s: String) -> AttributedString {
+        (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
+    }
+}
+
+private struct NotesHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
