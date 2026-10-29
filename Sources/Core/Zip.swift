@@ -52,10 +52,11 @@ final class ZipArchive {
     private(set) var entries: [ZipEntry] = []
     private(set) var prefix: UInt64 = 0          // bytes before the archive proper (SFX stubs)
     private(set) var cdOffset: UInt64 = 0
+    private var diskStarts: [UInt64] = []           // spanned (.z01 …) sets: where each disk begins in the joined file
     private(set) var comment = Data()
 
     init(url: URL) throws {
-        file = try FileIn(url)
+        file = try FileIn.openArchive(url)
         try parse()
     }
 
@@ -76,6 +77,13 @@ final class ZipArchive {
         let commentLen = Int(tail.le16(e + 20))
         if e + 22 + commentLen <= tail.count { comment = tail.subdata(in: tail.startIndex + e + 22..<tail.startIndex + e + 22 + commentLen) }
         var endOfCD = eocdAbs
+        // Info-ZIP style spanned sets: offsets are per disk, so they are shifted by where each disk starts in the joined file
+        let thisDisk = Int(tail.le16(e + 4)), cdDisk = Int(tail.le16(e + 6))
+        if thisDisk > 0 && file.parts.count > 1 {
+            var starts: [UInt64] = []
+            for pt in file.parts { starts.append(pt.start) }
+            diskStarts = starts
+        }
 
         if (total == 0xffff || cdSize == 0xffff_ffff || cdOff == 0xffff_ffff), eocdAbs >= 20 {
             let loc = try file.readExactly(at: eocdAbs - 20, 20)
@@ -87,7 +95,10 @@ final class ZipArchive {
                 endOfCD = z64Off
             }
         }
-        if cdOff + cdSize < endOfCD { prefix = endOfCD - (cdOff + cdSize) }
+        if !diskStarts.isEmpty {
+            guard cdDisk < diskStarts.count else { throw AXError.corrupt("bad spanned ZIP directory") }
+            cdOff += diskStarts[cdDisk]
+        } else if cdOff + cdSize < endOfCD { prefix = endOfCD - (cdOff + cdSize) }
         cdOffset = cdOff
 
         guard cdSize < 1 << 31 else { throw AXError.unsupported("central directory too large") }
@@ -104,6 +115,7 @@ final class ZipArchive {
             let nl = Int(cd.le16(p + 28)), xl = Int(cd.le16(p + 30)), cl = Int(cd.le16(p + 32))
             let intAttr = cd.le16(p + 36), extAttr = cd.le32(p + 38)
             var lho = UInt64(cd.le32(p + 42))
+            let startDisk = Int(cd.le16(p + 34))
             guard p + 46 + nl + xl + cl <= cd.count else { throw AXError.corrupt("truncated central directory") }
             let nameData = cd.subdata(in: cd.startIndex + p + 46..<cd.startIndex + p + 46 + nl)
             let extraData = cd.subdata(in: cd.startIndex + p + 46 + nl..<cd.startIndex + p + 46 + nl + xl)
@@ -144,6 +156,7 @@ final class ZipArchive {
                 q += 4 + len
             }
             if aesV == 2 { crc = 0 }
+            if !diskStarts.isEmpty { guard startDisk < diskStarts.count else { throw AXError.corrupt("bad spanned ZIP directory") }; lho += diskStarts[startDisk] }
             let name = unicodeName ?? String(data: nameData, encoding: .utf8) ?? String(data: nameData, encoding: .isoLatin1) ?? ""
             let isDir = name.hasSuffix("/") || name.hasSuffix("\\") || (madeBy >> 8 != 3 && extAttr & 0x10 != 0 && usize == 0)
             list.append(ZipEntry(name: name, isDir: isDir, flags: flags, method: method, realMethod: realMethod,
@@ -171,7 +184,7 @@ final class ZipArchive {
 
     /// Streams the (decrypted, decompressed) contents of `e` into `sink`, verifying CRC and size.
     func read(_ e: ZipEntry, password: String?, progress: ProgressTracker?, into sink: ByteSink) throws {
-        guard e.realMethod == 0 || e.realMethod == 8 else {
+        guard [0, 8, 9, 12, 14].contains(e.realMethod) else {
             throw AXError.unsupported("ZIP compression method \(e.realMethod)")
         }
         if e.csize == 0 && e.usize == 0 { return }
@@ -182,7 +195,8 @@ final class ZipArchive {
 
         var crc: UInt32 = 0
         var produced: UInt64 = 0
-        let inflater: Inflater? = e.realMethod == 8 ? Inflater() : nil
+        let inflater: Inflater? = e.realMethod == 8 || e.realMethod == 9 ? Inflater(deflate64: e.realMethod == 9) : nil
+        let pulled = e.realMethod == 12 || e.realMethod == 14        // bzip2 and LZMA are pulled through a decoder
         var finished = false
 
         func emit(_ d: Data) throws {
@@ -232,12 +246,35 @@ final class ZipArchive {
             }
         }
 
-        while remaining > tailBytes {
+        func nextPacked() throws -> Data {
+            guard remaining > tailBytes else { return Data() }
             let n = Int(min(UInt64(chunk), remaining - tailBytes))
             var d = try pull(n)
             if let mac = aesMac, let c = aesCipher { mac.update(d); d = try c.apply(d) }
             else if zc != nil { d = zc!.decrypt(d) }
-            try feed(d, last: remaining == tailBytes)
+            return d
+        }
+        if pulled {
+            let packed = ClosureSource(nextPacked)
+            let decoder: ByteSource
+            if e.realMethod == 12 { decoder = try Bzip2Source(source: packed) }
+            else {
+                let head = try packed.readExactly(4)
+                let psize = Int(head[head.startIndex + 2]) | Int(head[head.startIndex + 3]) << 8
+                guard psize >= 5, psize <= 64 else { throw AXError.corrupt("bad LZMA properties in “\(e.name)”") }
+                let props = try packed.readExactly(psize)
+                decoder = try LzmaSource(input: packed, props: props, unpackSize: e.usize)
+            }
+            while produced < e.usize {
+                let d = try decoder.read(Int(min(UInt64(chunk), e.usize - produced)))
+                if d.isEmpty { throw AXError.corrupt("“\(e.name)” ended unexpectedly") }
+                try emit(d)
+            }
+            while !(try packed.read(1 << 16)).isEmpty { }          // let the packed tail (and AES tag) through
+        } else {
+            while remaining > tailBytes {
+                try feed(try nextPacked(), last: remaining == tailBytes)
+            }
         }
         if let mac = aesMac {
             let tag = try pull(10)
@@ -521,4 +558,21 @@ final class ZipWriter {
         e.put32(UInt32(min(cdSize, 0xffff_ffff))); e.put32(UInt32(min(cdStart, 0xffff_ffff))); e.put16(0)
         try out.write(e)
     }
+}
+
+
+/// A byte source fed by a closure that returns the next chunk (empty at the end).
+final class ClosureSource: ByteSource {
+    private let next: () throws -> Data
+    private var buf = Data()
+    init(_ next: @escaping () throws -> Data) { self.next = next }
+    func read(_ n: Int) throws -> Data {
+        if buf.isEmpty { buf = try next() }
+        guard !buf.isEmpty else { return Data() }
+        let take = min(n, buf.count)
+        let d = buf.subdata(in: buf.startIndex..<buf.startIndex + take)
+        buf = buf.subdata(in: buf.startIndex + take..<buf.endIndex)
+        return d
+    }
+    func skip(_ n: UInt64) throws { try discard(n) }
 }

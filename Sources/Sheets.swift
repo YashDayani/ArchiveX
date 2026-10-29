@@ -6,6 +6,7 @@ struct AddSheet: View {
     @EnvironmentObject var model: ArchiveModel
     @Environment(\.dismiss) private var dismiss
     @State var draft: AddDraft
+    @State private var tabsPass = 0
 
     init(draft: AddDraft) { _draft = State(initialValue: draft) }
 
@@ -25,6 +26,10 @@ struct AddSheet: View {
             }
             .padding(.horizontal, 12)
             .frame(height: 300)
+            // macOS draws the tab labels squeezed ("G…", "P…") on the first layout pass and fixes them on the next one,
+            // so build the tab view a second time right after the sheet has appeared.
+            .id(tabsPass)
+            .onAppear { DispatchQueue.main.async { tabsPass = 1 } }
 
             Divider()
             HStack {
@@ -60,6 +65,10 @@ struct AddSheet: View {
                     ForEach(0..<6) { Text(levels[$0]).tag($0) }
                 }
             }
+            if draft.format == .rar {
+                Text("RAR archives made by ArchiveX store files without compressing them. Choose 7z for the smallest files.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if draft.format.solid { Toggle("Create solid archive (smaller, slower to edit)", isOn: $draft.solid) }
             Toggle("Test archived files", isOn: $draft.test)
             Toggle("Delete files after archiving", isOn: $draft.deleteAfter)
@@ -87,10 +96,12 @@ struct AddSheet: View {
                 Text(draft.format == .zip
                      ? (draft.legacyZipCrypto ? "Legacy ZipCrypto is easy to break. Use it only if you need to open the file in Archive Utility."
                                               : "ZIP archives are encrypted with AES-256. File names stay visible.")
+                     : draft.format == .rar
+                     ? "RAR archives are encrypted with AES-256. File names stay visible."
                      : "Archives are encrypted with AES-256. Without “Encrypt file names”, people can still see what is inside but cannot read the files.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
-                Text("\(draft.format.rawValue) archives cannot be password protected. Choose 7z or ZIP for encryption.")
+                Text("\(draft.format.rawValue) archives cannot be password protected. Choose 7z, RAR or ZIP for encryption.")
                     .foregroundStyle(.secondary)
             }
         }

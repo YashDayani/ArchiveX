@@ -3,13 +3,15 @@ import Foundation
 // The façade the app talks to. Every function here is synchronous and cancellable
 // (Task.checkCancellation), so the model runs them on a background task.
 
-enum AXKind { case zip, tar, gz, tgz, bz2, tbz2, xz, txz, sevenZ, rar, iso, cpio }
+enum AXKind { case zip, tar, gz, tgz, bz2, tbz2, xz, txz, zst, tzst, sevenZ, rar, iso, cpio, ar, lzw, rpm, xar, cab, dmg, lzma }
 
 extension AXKind {
     /// kinds whose payload is one compressed stream
-    var isStream: Bool { self == .gz || self == .bz2 || self == .xz }
+    var isStream: Bool { self == .gz || self == .bz2 || self == .xz || self == .zst }
+    /// kinds handled through the generic `ContainerArchive` layer
+    var isContainer: Bool { self == .ar || self == .lzw || self == .rpm || self == .xar || self == .cab || self == .dmg || self == .lzma }
     /// kinds that are a tar inside a compressor
-    var isCompressedTar: Bool { self == .tgz || self == .tbz2 || self == .txz }
+    var isCompressedTar: Bool { self == .tgz || self == .tbz2 || self == .txz || self == .tzst }
     var isTarLike: Bool { self == .tar || isCompressedTar }
 }
 
@@ -39,20 +41,51 @@ enum AXCore {
     // MARK: - format detection
 
     static func kind(of url: URL) -> AXKind? {
-        let n = url.lastPathComponent.lowercased()
+        var n = url.lastPathComponent.lowercased()
+        if n.count > 4, let dot = n.lastIndex(of: "."), n.distance(from: dot, to: n.endIndex) == 4,
+           n[n.index(after: dot)...].allSatisfy({ $0.isASCII && $0.isNumber }), n[..<dot].hasSuffix(".7z") || n[..<dot].hasSuffix(".zip") {
+            n = String(n[..<dot])                                           // split archive: name.7z.001, name.zip.002, …
+        }
         if n.hasSuffix(".tar.gz") || n.hasSuffix(".tgz") || n.hasSuffix(".taz") { return .tgz }
         if n.hasSuffix(".tar.bz2") || n.hasSuffix(".tbz2") || n.hasSuffix(".tbz") || n.hasSuffix(".tb2") { return .tbz2 }
         if n.hasSuffix(".bz2") { return .bz2 }
         if n.hasSuffix(".tar.xz") || n.hasSuffix(".txz") { return .txz }
         if n.hasSuffix(".xz") { return .xz }
+        if n.hasSuffix(".tar.zst") || n.hasSuffix(".tzst") { return .tzst }
+        if n.hasSuffix(".zst") { return .zst }
         for e in [".zip", ".jar", ".cbz", ".apk", ".ipa", ".epub"] where n.hasSuffix(e) { return .zip }
         if n.hasSuffix(".7z") { return .sevenZ }
         if n.hasSuffix(".iso") { return .iso }
         if n.hasSuffix(".cpio") { return .cpio }
+        for e in [".deb", ".udeb", ".ar", ".a"] where n.hasSuffix(e) { return .ar }
+        if n.hasSuffix(".rpm") { return .rpm }
+        if n.hasSuffix(".xar") || n.hasSuffix(".pkg") || n.hasSuffix(".mpkg") { return .xar }
+        if n.hasSuffix(".cab") { return .cab }
+        if n.hasSuffix(".dmg") { return .dmg }
+        if n.hasSuffix(".z") { return .lzw }
+        if n.hasSuffix(".lzma") { return .lzma }
         if n.hasSuffix(".rar") { return .rar }
+        if n.count > 4, let dot = n.lastIndex(of: "."), n.distance(from: dot, to: n.endIndex) == 4 {       // old volume names: .r00 … .r99, .s00 …
+            let ext = n[n.index(after: dot)...]
+            if (ext.first == "r" || ext.first == "s"), ext.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber }) { return .rar }
+            if ext.first == "z", ext.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber }) { return .zip }          // spanned ZIP: name.z01
+        }
         if n.hasSuffix(".tar") { return .tar }
         if n.hasSuffix(".gz") { return .gz }
         return nil
+    }
+
+    static func container(_ url: URL, _ k: AXKind) throws -> ContainerArchive {
+        switch k {
+        case .ar: return try ArArchive(url: url)
+        case .lzw: return try LzwArchive(url: url)
+        case .rpm: return try RpmArchive(url: url)
+        case .xar: return try XarArchive(url: url)
+        case .cab: return try CabArchive(url: url)
+        case .dmg: return try DmgArchive(url: url)
+        case .lzma: return try LzmaAloneArchive(url: url)
+        default: throw AXError.unsupported(url.pathExtension)
+        }
     }
 
     static func handles(_ url: URL) -> Bool { kind(of: url) != nil }
@@ -74,6 +107,7 @@ enum AXCore {
         case .tgz, .gz: return (try GzipSource(file: f), f)
         case .tbz2, .bz2: return (try Bzip2Source(file: f), f)
         case .txz, .xz: return (try XzSource(file: f), f)
+        case .tzst, .zst: return (try ZstdSource(file: f), f)
         default: return (FileSource(f), f)
         }
     }
@@ -98,11 +132,13 @@ enum AXCore {
             return try IsoArchive(url: url).listing
         case .cpio:
             return try CpioArchive(url: url).listing
-        case .tar, .tgz, .tbz2, .txz:
+        case .ar, .lzw, .rpm, .xar, .cab, .dmg, .lzma:
+            return Container.listing(try container(url, k))
+        case .tar, .tgz, .tbz2, .txz, .tzst:
             let (src, f) = try tarSource(url, k)
             let reader = TarReader(src)
             var l = Listing()
-            l.details = k == .tgz ? "TAR · gzip" : k == .tbz2 ? "TAR · bzip2" : k == .txz ? "TAR · xz" : "TAR"
+            l.details = k == .tgz ? "TAR · gzip" : k == .tbz2 ? "TAR · bzip2" : k == .txz ? "TAR · xz" : k == .tzst ? "TAR · Zstandard" : "TAR"
             while let e = try reader.next() {
                 try Task.checkCancellation()
                 try reader.skipData(e)
@@ -112,11 +148,11 @@ enum AXCore {
             }
             _ = f
             return l
-        case .bz2, .xz:
+        case .bz2, .xz, .zst:
             let f = try FileIn(url)
             _ = try decoded(url, k)
             var l = Listing()
-            l.details = k == .xz ? "xz" : "bzip2"
+            l.details = k == .xz ? "xz" : k == .zst ? "Zstandard" : "bzip2"
             let size = Int64(k == .xz ? (XzSource.recordedSize(of: f) ?? 0) : 0)
             l.entries = [ArchiveEntry(path: streamName(url, k, nil), isDir: false, size: size, packed: Int64(f.size),
                                       ratio: size > 0 ? "\(min(100, Int(Double(f.size) / Double(size) * 100)))%" : "", mtime: "",
@@ -150,6 +186,9 @@ enum AXCore {
             let total = z.entries.filter { !$0.isDir && (selection.isEmpty || ex.isSelected(SafePath.clean($0.name) ?? "")) }
                 .reduce(Int64(0)) { $0 + Int64($1.usize) }
             try z.extract(selection: selection, to: ex, password: password, progress: ProgressTracker(total: total, report: progress))
+        case .ar, .lzw, .rpm, .xar, .cab, .dmg, .lzma:
+            let z = try container(url, k)
+            try Container.extract(z, to: ex, progress: ProgressTracker(total: Container.total(z), report: progress))
         case .iso:
             let z = try IsoArchive(url: url)
             let total = z.entries.filter { !$0.isDir && ex.isSelected(SafePath.clean($0.path) ?? "") }.reduce(Int64(0)) { $0 + Int64($1.size) }
@@ -166,7 +205,7 @@ enum AXCore {
             let z = try SevenZipArchive(url: url, password: password)
             let total = z.files.filter { !$0.isDir && ex.isSelected(SafePath.clean($0.name) ?? "") }.reduce(Int64(0)) { $0 + Int64($1.size) }
             try z.extract(to: ex, progress: ProgressTracker(total: total, report: progress))
-        case .tar, .tgz, .tbz2, .txz:
+        case .tar, .tgz, .tbz2, .txz, .tzst:
             let (src, f) = try tarSource(url, k)
             let reader = TarReader(src)
             let tracker = ProgressTracker(total: k == .tar ? Int64(f.size) : Int64(f.size) * 4, report: progress)
@@ -209,7 +248,7 @@ enum AXCore {
             }
             while !(try src.read(1 << 20)).isEmpty { try Task.checkCancellation() }       // verify the container's final checksums
             for (u, m, t) in dirs.reversed() { ex.finalize(u, mode: m, mtime: t) }
-        case .gz, .bz2, .xz:
+        case .gz, .bz2, .xz, .zst:
             let (g, f) = try decoded(url, k)
             let name = streamName(url, k, (g as? GzipSource)?.storedName)
             if let u = try ex.destination(for: name, isDir: false) {
@@ -235,6 +274,9 @@ enum AXCore {
             let z = try ZipArchive(url: url)
             let total = z.entries.reduce(Int64(0)) { $0 + Int64($1.usize) }
             try z.test(password: password, progress: ProgressTracker(total: total, report: progress))
+        case .ar, .lzw, .rpm, .xar, .cab, .dmg, .lzma:
+            let z = try container(url, k)
+            try Container.test(z, progress: ProgressTracker(total: Container.total(z), report: progress))
         case .iso:
             let z = try IsoArchive(url: url)
             try z.test(progress: ProgressTracker(total: z.entries.reduce(Int64(0)) { $0 + Int64($1.size) }, report: progress))
@@ -247,14 +289,14 @@ enum AXCore {
         case .sevenZ:
             let z = try SevenZipArchive(url: url, password: password)
             try z.test(progress: ProgressTracker(total: z.files.reduce(Int64(0)) { $0 + Int64($1.size) }, report: progress))
-        case .tar, .tgz, .tbz2, .txz:
+        case .tar, .tgz, .tbz2, .txz, .tzst:
             let (src, f) = try tarSource(url, k)
             let reader = TarReader(src)
             let tracker = ProgressTracker(total: Int64(f.size) * (k == .tar ? 1 : 4), report: progress)
             let null = NullSink()
             while let e = try reader.next() { try Task.checkCancellation(); try reader.copyData(e, to: null, progress: tracker) }
             while !(try src.read(1 << 20)).isEmpty { try Task.checkCancellation() }       // run the container's final checksums
-        case .gz, .bz2, .xz:
+        case .gz, .bz2, .xz, .zst:
             let (g, _) = try decoded(url, k)
             while !(try g.read(1 << 20)).isEmpty { try Task.checkCancellation() }
         }
@@ -316,6 +358,23 @@ enum AXCore {
         try w.finish()
     }
 
+    private static func writeRar(items: [AXItem], to tmp: URL, spec: AXCreate, progress: ProgressTracker) throws {
+        let w = try Rar5Writer(url: tmp, solid: false, password: spec.password)
+        for it in items {
+            try Task.checkCancellation()
+            switch it.kind {
+            case .dir:
+                try w.addDirectory(name: it.name, mtime: it.mtime, mode: it.mode)
+            case .symlink:
+                let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: it.url.path)) ?? ""
+                try w.addSymlink(name: it.name, target: target, mtime: it.mtime, mode: it.mode)
+            case .file:
+                try w.addFile(source: it.url, name: it.name, size: it.size, mtime: it.mtime, mode: it.mode, progress: progress)
+            }
+        }
+        try w.finish()
+    }
+
     private static func write(items: [AXItem], format: ArchiveFormat, to tmp: URL, level: Int, password: String?, legacy: Bool,
                               progress: ProgressTracker) throws {
         switch format {
@@ -365,6 +424,7 @@ enum AXCore {
         let tmp = spec.output.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).axtmp")
         do {
             if spec.format == .sevenZ { try writeSevenZ(items: items, to: tmp, spec: spec, progress: tracker) }
+            else if spec.format == .rar { try writeRar(items: items, to: tmp, spec: spec, progress: tracker) }
             else {
                 try write(items: items, format: spec.format, to: tmp, level: spec.level, password: spec.password,
                           legacy: spec.legacyZipCrypto, progress: tracker)
@@ -382,11 +442,57 @@ enum AXCore {
 
     // MARK: - editing (rewrite the archive without / with extra entries)
 
-    static func canEdit(_ url: URL) -> Bool { [.zip, .tar, .sevenZ].contains(kind(of: url)) }
+    private static func editRar(url: URL, tmp: URL, remove selection: [(path: String, isDir: Bool)], add items: [AXItem], roots: [URL],
+                                level: Int, password: String?, progress: ProgressTracker) throws {
+        let arc = try RarArchive(url: url, password: password)
+        let newNames = Set(items.map(\.name))
+        func matches(_ path: String) -> Bool {
+            selection.contains { $0.path == path || ($0.isDir && path.hasPrefix($0.path + "/")) } || newNames.contains(path)
+        }
+        let tempDir = tmp.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).axrebuild")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // Entries whose names fail the path check (“../…”, absolute paths) are never carried over: they were not extracted
+        // either, and falling back to the raw name would read whatever file that name points at outside the temp folder.
+        let keepEntries = arc.entries.filter { e in SafePath.clean(e.name).map { !matches($0) } ?? false }
+        let ex = try Extractor(destination: tempDir, overwrite: .all, keepPaths: true, selection: [])
+        try arc.extract(to: ex, progress: progress)
+
+        let w = try Rar5Writer(url: tmp, solid: false, password: password)
+        for e in keepEntries {
+            try Task.checkCancellation()
+            guard let clean = SafePath.clean(e.name) else { continue }
+            let localURL = tempDir.appendingPathComponent(clean)
+            let inside = tempDir.resolvingSymlinksInPath().path + "/"
+            guard localURL.resolvingSymlinksInPath().path.hasPrefix(inside) || e.isDir || e.link != nil else { continue }
+            if e.isDir {
+                try w.addDirectory(name: clean, mtime: e.mtime ?? Date(), mode: UInt32(e.attrib & 0o7777))
+            } else if let link = e.link {
+                try w.addSymlink(name: clean, target: link.target, mtime: e.mtime ?? Date(), mode: UInt32(e.attrib & 0o7777))
+            } else if FileManager.default.fileExists(atPath: localURL.path) {
+                let sz = (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? UInt64) ?? 0
+                try w.addFile(source: localURL, name: clean, size: sz, mtime: e.mtime ?? Date(), mode: UInt32(e.attrib & 0o7777), progress: progress)
+            }
+        }
+        for it in items {
+            try Task.checkCancellation()
+            switch it.kind {
+            case .dir: try w.addDirectory(name: it.name, mtime: it.mtime, mode: it.mode)
+            case .symlink:
+                let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: it.url.path)) ?? ""
+                try w.addSymlink(name: it.name, target: target, mtime: it.mtime, mode: it.mode)
+            case .file: try w.addFile(source: it.url, name: it.name, size: it.size, mtime: it.mtime, mode: it.mode, progress: progress)
+            }
+        }
+        try w.finish()
+    }
+
+    static func canEdit(_ url: URL) -> Bool { [.zip, .tar, .sevenZ, .rar].contains(kind(of: url)) }
 
     static func edit(_ url: URL, remove selection: [(path: String, isDir: Bool)], add roots: [URL], level: Int, password: String?,
                      legacy: Bool, progress: @escaping (Double) -> Void) throws {
-        guard let k = kind(of: url), k == .zip || k == .tar || k == .sevenZ else { throw AXError.unsupported("editing this format") }
+        guard let k = kind(of: url), k == .zip || k == .tar || k == .sevenZ || k == .rar else { throw AXError.unsupported("editing this format") }
         let newItems = try collect(roots)
         let newNames = Set(newItems.map(\.name))
         func matches(_ path: String) -> Bool {
@@ -394,7 +500,11 @@ enum AXCore {
         }
         let tmp = url.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).axtmp")
         do {
-            if k == .sevenZ {
+            if k == .rar {
+                let total = Int64((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? 0) + newItems.reduce(0) { $0 + Int64($1.size) }
+                let tracker = ProgressTracker(total: total, report: progress)
+                try editRar(url: url, tmp: tmp, remove: selection, add: newItems, roots: roots, level: level, password: password, progress: tracker)
+            } else if k == .sevenZ {
                 let arc = try SevenZipArchive(url: url, password: password)
                 let total = arc.files.reduce(Int64(0)) { $0 + Int64($1.size) } + newItems.reduce(0) { $0 + Int64($1.size) }
                 let tracker = ProgressTracker(total: total, report: progress)

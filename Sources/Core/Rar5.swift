@@ -1,6 +1,7 @@
 import Foundation
 import CommonCrypto
 import CryptoKit
+import zlib
 
 // RAR 5.0 reader (decompression only). Written from the public RAR 5.0 format description.
 // ArchiveX never creates RAR files: RARLAB's license reserves the compression algorithm.
@@ -8,7 +9,7 @@ import CryptoKit
 
 // MARK: - Bit reader (MSB first)
 
-private final class RBits {
+final class RBits {
     private let src: ByteSource
     private var buf = [UInt8]()
     private var ip = 0
@@ -18,6 +19,8 @@ private final class RBits {
     private(set) var consumed: UInt64 = 0
 
     init(_ s: ByteSource) { src = s }
+    /// Bits left in the register (used to hand the stream back to byte-wise readers).
+    var bitsInRegister: Int { n }
 
     @inline(__always) func refill() throws {
         while n <= 56 {
@@ -41,7 +44,7 @@ private final class RBits {
     var overrun: Bool { n < 0 }
 }
 
-private struct RHuff {
+struct RHuff {
     var table = [UInt16](repeating: 0, count: 1 << 15)
     var used = false
 
@@ -327,17 +330,17 @@ final class Rar5Decoder {
 
 // MARK: - AES-256-CBC for RAR
 
-private final class RarAESSource: ByteSource {
+final class RarAESSource: ByteSource {
     private let input: ByteSource
     private var cryptor: CCCryptorRef?
     private var carry = Data()
     private var out = Data(); private var outPos = 0
     private var done = false
 
-    init(input: ByteSource, key: Data, iv: Data) throws {
+    init(input: ByteSource, key: Data, iv: Data, keyLength: Int = 32) throws {
         self.input = input
         let st = key.withUnsafeBytes { k in iv.withUnsafeBytes { v in
-            CCCryptorCreate(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), 0, k.baseAddress, 32, v.baseAddress, &cryptor)
+            CCCryptorCreate(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), 0, k.baseAddress, keyLength, v.baseAddress, &cryptor)
         } }
         guard st == kCCSuccess else { throw AXError.io("Could not start AES.") }
     }
@@ -365,7 +368,7 @@ private final class RarAESSource: ByteSource {
 }
 
 /// Reads at most `limit` bytes of a source (the unpacked size of a stored, padded, encrypted file).
-private final class LimitSource: ByteSource {
+final class LimitSource: ByteSource {
     private let input: ByteSource
     private var left: UInt64
     init(_ i: ByteSource, limit: UInt64) { input = i; left = limit }
@@ -384,6 +387,13 @@ struct RarEnc {
     var iv: Data
     var check: Data?
     var useMAC: Bool
+    var v3 = false                // RAR 3/4: AES-128, SHA-1 key derivation, no password check value
+}
+
+struct RarPart {
+    var file: FileIn
+    var offset: UInt64
+    var length: UInt64
 }
 
 struct RarEntry {
@@ -401,6 +411,10 @@ struct RarEntry {
     var dataOffset: UInt64 = 0
     var enc: RarEnc?
     var link: (type: Int, target: String)?
+    var unpVer = 50               // 50 = RAR 5; otherwise the RAR 1.x–4.x "unpack version" (29 = RAR 3/4)
+    var parts: [RarPart] = []     // RAR 3/4: where the packed data lives (several parts for multi-volume archives)
+    var dataLink = false          // RAR 3/4 symbolic link: the target is the (packed) file data
+    var incomplete = false        // a following volume is missing
     var unixMode: UInt32? { hostOS == 1 ? UInt32(truncatingIfNeeded: attrib) : nil }
 }
 
@@ -408,12 +422,16 @@ final class RarArchive {
     static let signature5: [UInt8] = [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00]
     static let signature4: [UInt8] = [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00]
 
-    let file: FileIn
-    private(set) var entries: [RarEntry] = []
-    private(set) var isSolid = false
-    private(set) var headersEncrypted = false
-    private let password: String?
+    var file: FileIn
+    var entries: [RarEntry] = []
+    var isSolid = false
+    var headersEncrypted = false
+    var generation = 5            // 5 = RAR 5 format, 4 = RAR 1.5–4.x format
+    var volumeCount = 1
+    var newNumbering = false
+    let password: String?
     private var keyCache: [String: (key: Data, hashKey: Data, check: Data)] = [:]
+    var keyCache3: [String: (key: Data, iv: Data)] = [:]
 
     static func isRar5(_ url: URL) -> Bool {
         guard let f = try? FileIn(url), let h = try? f.read(at: 0, 8) else { return false }
@@ -471,16 +489,32 @@ final class RarArchive {
 
     private func parse() throws {
         let head = try file.read(at: 0, 8)
-        if Array(head.prefix(7)) == RarArchive.signature4 { throw AXError.unsupported("this is an older RAR 4 archive; ArchiveX opens RAR 5 archives") }
+        if Array(head.prefix(7)) == RarArchive.signature4 { generation = 4; try parse4(); return }
         guard Array(head) == RarArchive.signature5 else { throw AXError.corrupt("not a RAR 5 archive") }
+        if let first = RarArchive.firstVolumeURL(file.url), first != file.url, FileManager.default.fileExists(atPath: first.path),
+           Array((try? FileIn(first).read(at: 0, 8)) ?? Data()) == RarArchive.signature5 { file = try FileIn(first) }       // opened a later volume
+        var vol = file
+        var cont = try parse5(vol)
+        while cont {
+            guard let next = RarArchive.nextVolumeURL(vol.url, newNumbering: true), FileManager.default.fileExists(atPath: next.path) else { break }
+            vol = try FileIn(next)
+            guard Array(try vol.read(at: 0, 8)) == RarArchive.signature5 else { throw AXError.corrupt("“\(next.lastPathComponent)” is not a RAR 5 volume") }
+            volumeCount += 1
+            cont = try parse5(vol)
+        }
+    }
+
+    /// Reads the blocks of one volume; returns true when the archive continues in a following volume.
+    private func parse5(_ f: FileIn) throws -> Bool {
         var pos: UInt64 = 8
         var headerKey: Data?
-        while pos + 7 <= file.size {
+        var continues = false
+        while pos + 7 <= f.size {
             var h: Data
             var next: UInt64
             if let key = headerKey {
-                let iv = try file.readExactly(at: pos, 16)
-                let first = try file.readExactly(at: pos + 16, 16)
+                let iv = try f.readExactly(at: pos, 16)
+                let first = try f.readExactly(at: pos + 16, 16)
                 // decrypt the first block to learn the size, then the rest, all in one CBC chain
                 var cryptor: CCCryptorRef?
                 let st = key.withUnsafeBytes { k in iv.withUnsafeBytes { v in CCCryptorCreate(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), 0, k.baseAddress, 32, v.baseAddress, &cryptor) } }
@@ -497,19 +531,19 @@ final class RarArchive {
                 let hs = Int(try r.vint())
                 let total = r.p + hs
                 let enc = (total + 15) / 16 * 16
-                guard hs < 1 << 21, pos + 16 + UInt64(enc) <= file.size else { throw AXError.wrongPassword }
-                if enc > 16 { plain.append(try dec(try file.readExactly(at: pos + 32, enc - 16))) }
+                guard hs < 1 << 21, pos + 16 + UInt64(enc) <= f.size else { throw AXError.wrongPassword }
+                if enc > 16 { plain.append(try dec(try f.readExactly(at: pos + 32, enc - 16))) }
                 h = plain.prefix(total)
                 next = pos + 16 + UInt64(enc)
                 guard CRC32.update(0, h.suffix(from: h.startIndex + 4)) == h.le32(0) else { throw AXError.wrongPassword }
             } else {
-                let probe = try file.read(at: pos, 16)
+                let probe = try f.read(at: pos, 16)
                 guard probe.count >= 8 else { break }
                 var r = RarVint(probe); r.p = 4
                 let hs = Int(try r.vint())
                 let total = r.p + hs
-                guard hs > 0, hs < 1 << 21, pos + UInt64(total) <= file.size else { throw AXError.corrupt("truncated RAR header") }
-                h = try file.readExactly(at: pos, total)
+                guard hs > 0, hs < 1 << 21, pos + UInt64(total) <= f.size else { throw AXError.corrupt("truncated RAR header") }
+                h = try f.readExactly(at: pos, total)
                 next = pos + UInt64(total)
                 guard CRC32.update(0, h.suffix(from: h.startIndex + 4)) == h.le32(0) else { throw AXError.corrupt("RAR header CRC mismatch") }
             }
@@ -527,7 +561,6 @@ final class RarArchive {
             case 1:                                                    // main header
                 let af = try r.vint()
                 isSolid = af & 4 != 0
-                if af & 1 != 0 { throw AXError.unsupported("multi-volume RAR archives") }
             case 4:                                                    // archive encryption header
                 let e = try parseEnc(&r, extra: false)
                 let keys = try derive(salt: e.salt, log2: e.log2)
@@ -552,7 +585,7 @@ final class RarArchive {
                 ent.name = String(decoding: try r.bytes(nl), as: UTF8.self)
                 ent.packSize = dataSize
                 ent.dataOffset = dataOffset
-                guard dataOffset + dataSize <= file.size else { throw AXError.corrupt("RAR archive is truncated (data of “\(ent.name)” is incomplete)") }
+                guard dataOffset + dataSize <= f.size else { throw AXError.corrupt("RAR archive is truncated (data of “\(ent.name)” is incomplete)") }
                 // extra records
                 var ex = RarVint(h); ex.p = bodyEnd - extraSize
                 while ex.p < bodyEnd {
@@ -574,14 +607,30 @@ final class RarArchive {
                     }
                     ex.p = start + sz
                 }
-                if type == 2 { entries.append(ent) }
+                ent.parts = [RarPart(file: f, offset: dataOffset, length: dataSize)]
+                if type == 2 {
+                    let splitBefore = flags & 8 != 0, splitAfter = flags & 0x10 != 0
+                    if splitBefore, let li = entries.indices.last, entries[li].name == ent.name, entries[li].incomplete {
+                        entries[li].parts.append(contentsOf: ent.parts)
+                        entries[li].packSize += dataSize
+                        entries[li].incomplete = splitAfter
+                        if !splitAfter { entries[li].crc = ent.crc; entries[li].enc?.useMAC = ent.enc?.useMAC ?? false }      // the whole-file checksum (and its MAC flag) comes with the last piece
+                    } else {
+                        ent.incomplete = splitAfter
+                        if splitAfter { ent.crc = nil }
+                        entries.append(ent)
+                    }
+                }
             case 5:
-                pos = file.size; continue
+                let ef = r.p < bodyEnd ? try r.vint() : 0
+                continues = ef & 1 != 0
+                pos = f.size; continue
             default: break
             }
             pos = next + dataSize
             if flags & 4 == 0 && type > 5 { /* unknown required block: ignore */ }
         }
+        return continues
     }
 
     // MARK: public API
@@ -590,7 +639,7 @@ final class RarArchive {
         var l = Listing()
         l.solid = isSolid
         l.headerEncrypted = headersEncrypted
-        l.details = (["RAR 5"] + (isSolid ? ["solid"] : []) + (entries.contains { $0.enc != nil } || headersEncrypted ? ["AES-256"] : []) + (headersEncrypted ? ["encrypted names"] : [])).joined(separator: " · ")
+        l.details = (["RAR \(generation)"] + (isSolid ? ["solid"] : []) + (volumeCount > 1 ? ["\(volumeCount) volumes"] : []) + (entries.contains { $0.enc != nil } || headersEncrypted ? [generation == 4 ? "AES-128" : "AES-256"] : []) + (headersEncrypted ? ["encrypted names"] : [])).joined(separator: " · ")
         l.entries = entries.map { e in
             let size = Int64(e.size ?? 0)
             let clean = SafePath.clean(e.name) ?? e.name
@@ -602,6 +651,12 @@ final class RarArchive {
     }
 
     private var decoder: Rar5Decoder?
+    private var decoder4: Rar4Decoder?
+
+    private func decoder4For() -> Rar4Decoder {
+        if let d = decoder4 { return d }
+        let d = Rar4Decoder(); decoder4 = d; return d
+    }
 
     private func decoderFor() -> Rar5Decoder {
         if let d = decoder { return d }
@@ -617,9 +672,17 @@ final class RarArchive {
     }
 
     private func source(for e: RarEntry) throws -> (ByteSource, Data?) {
-        var s: ByteSource = RangeSource(file: file, offset: e.dataOffset, length: e.packSize)
+        var s: ByteSource
+        if e.parts.isEmpty { s = RangeSource(file: file, offset: e.dataOffset, length: e.packSize) }
+        else {
+            if e.incomplete { throw AXError.corrupt("The next volume of this archive is missing, so “\(e.name)” can’t be read.") }
+            s = ConcatSource(e.parts.map { RangeSource(file: $0.file, offset: $0.offset, length: $0.length) })
+        }
         var hashKey: Data?
-        if let enc = e.enc {
+        if let enc = e.enc, enc.v3 {
+            let k = try derive3(salt: enc.salt)
+            s = try RarAESSource(input: s, key: k.key, iv: k.iv, keyLength: 16)
+        } else if let enc = e.enc {
             let keys = try derive(salt: enc.salt, log2: enc.log2)
             try verifyPassword(enc, keys)
             s = try RarAESSource(input: s, key: keys.key, iv: enc.iv)
@@ -638,7 +701,14 @@ final class RarArchive {
 
     /// Decodes one entry's data into `sink`, verifying its checksum.
     private func extractData(_ e: RarEntry, to sink: ByteSink, progress: ProgressTracker?) throws {
-        if e.size == 0 { return }                                   // nothing to decode (and nothing to checksum)
+        if e.size == 0 {
+            // Nothing to write or checksum. But an empty file inside a solid RAR 3/4 stream still carries the stream's
+            // end-of-block marker, which tells the decoder whether the next file starts with new tables.
+            guard e.unpVer < 50, e.unpVer >= 29, e.method != 0, e.packSize > 0, e.solid, !e.incomplete else { return }
+            let (src, _) = try source(for: e)
+            try decoder4For().decode(input: src, size: 0, solid: true, sink: NullSink(), progress: nil)
+            return
+        }
         let (src, hashKey) = try source(for: e)
         let crcSink = CRCSink(out: sink)
         do {
@@ -650,11 +720,13 @@ final class RarArchive {
                     if d.isEmpty { throw AXError.corrupt("“\(e.name)” ended unexpectedly") }
                     left -= UInt64(d.count); try crcSink.write(d); try progress?.add(d.count)
                 }
+            } else if e.unpVer < 50 {
+                try decoder4For().decode(input: src, size: e.size, solid: e.solid, sink: crcSink, progress: progress)
             } else {
                 try decoderFor().decode(input: src, size: e.size, solid: e.solid, sink: crcSink, progress: progress)
             }
         } catch let err as AXError {
-            if e.enc != nil, case .corrupt = err { throw AXError.wrongPassword }
+            if e.enc != nil { switch err { case .corrupt, .unsupported: throw AXError.wrongPassword; default: break } }
             throw err
         }
         if let want = e.crc {
@@ -673,6 +745,14 @@ final class RarArchive {
                 if wanted, ex.keepPaths, let u = try ex.destination(for: e.name, isDir: true) {
                     try FileManager.default.createDirectory(at: u, withIntermediateDirectories: true); ex.finalize(u, mode: e.unixMode, mtime: e.mtime)
                 }
+                continue
+            }
+            if e.dataLink {
+                if wanted {
+                    let mem = MemorySink()
+                    try extractData(e, to: mem, progress: nil)
+                    if let u = try ex.destination(for: e.name, isDir: false) { ex.makeSymlink(at: u, target: String(decoding: mem.data, as: UTF8.self)) }
+                } else if e.solid || isSolid { try extractData(e, to: NullSink(), progress: nil) }
                 continue
             }
             if let l = e.link {
@@ -698,7 +778,7 @@ final class RarArchive {
     }
 
     func test(progress: ProgressTracker?) throws {
-        for e in entries where !e.isDir && e.link == nil {
+        for e in entries where !e.isDir && e.link == nil && !e.dataLink {
             try Task.checkCancellation()
             try extractData(e, to: NullSink(), progress: progress)
         }
@@ -733,4 +813,286 @@ struct RarVint {
     }
     mutating func u32() throws -> UInt32 { try bytes(4).le32(0) }
     mutating func u64() throws -> UInt64 { try bytes(8).le64(0) }
+}
+
+// MARK: - Native Pure-Swift RAR 5 Writer
+
+final class Rar5Writer {
+    private let out: FileOut
+    private let solid: Bool
+    private let password: String?
+    private let log2: Int = 15 // 32,768 PBKDF2 rounds
+
+    init(url: URL, solid: Bool = true, password: String? = nil) throws {
+        self.out = try FileOut(url)
+        self.solid = solid
+        self.password = (password?.isEmpty ?? true) ? nil : password
+        // Write RAR 5 signature (8 bytes)
+        try out.write(Data([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]))
+        // Write Main Archive Header: type 1, flags 0, archive flags: (solid ? 4 : 0)
+        var body = Data()
+        Self.writeVint(solid ? 4 : 0, into: &body)
+        try out.write(Self.makeBlock(type: 1, flags: 0, body: body))
+    }
+
+    static func writeVint(_ val: UInt64, into data: inout Data) {
+        var v = val
+        while true {
+            var b = UInt8(v & 0x7f)
+            v >>= 7
+            if v > 0 {
+                b |= 0x80
+                data.append(b)
+            } else {
+                data.append(b)
+                break
+            }
+        }
+    }
+
+    static func makeBlock(type: UInt64, flags: UInt64, body: Data, extraSize: UInt64? = nil, dataSize: UInt64? = nil) -> Data {
+        var hdr = Data()
+        writeVint(type, into: &hdr)
+        var fl = flags
+        if extraSize != nil { fl |= 1 }
+        if dataSize != nil { fl |= 2 }
+        writeVint(fl, into: &hdr)
+        if let es = extraSize {
+            writeVint(es, into: &hdr)
+        }
+        if let ds = dataSize {
+            writeVint(ds, into: &hdr)
+        }
+        hdr.append(body)
+
+        var sizeBytes = Data()
+        writeVint(UInt64(hdr.count), into: &sizeBytes)
+
+        var payload = sizeBytes
+        payload.append(hdr)
+
+        var c: UInt32 = 0
+        payload.withUnsafeBytes { raw in
+            c = UInt32(zlib.crc32(uLong(c), raw.bindMemory(to: Bytef.self).baseAddress, uInt(raw.count)))
+        }
+
+        var block = Data()
+        block.append(UInt8(c & 0xff))
+        block.append(UInt8((c >> 8) & 0xff))
+        block.append(UInt8((c >> 16) & 0xff))
+        block.append(UInt8((c >> 24) & 0xff))
+        block.append(payload)
+        return block
+    }
+
+    private func deriveKeys(salt: Data, password: String) throws -> (key: Data, hashKey: Data, check: Data) {
+        let pwb = Array(password.utf8)
+        func pbkdf(_ rounds: UInt32) throws -> Data {
+            var out = [UInt8](repeating: 0, count: 32)
+            let st = salt.withUnsafeBytes { s in
+                CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2), pwb.map { Int8(bitPattern: $0) }, pwb.count,
+                                     s.bindMemory(to: UInt8.self).baseAddress, salt.count,
+                                     CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256), rounds, &out, 32)
+            }
+            guard st == kCCSuccess else { throw AXError.io("Key derivation failed.") }
+            return Data(out)
+        }
+        let n = UInt32(1) << UInt32(log2)
+        return (try pbkdf(n), try pbkdf(n + 16), try pbkdf(n + 32))
+    }
+
+    private func makeEncRecord(salt: Data, iv: Data, checkKey: Data) -> Data {
+        var fold = [UInt8](repeating: 0, count: 8)
+        for (i, b) in checkKey.enumerated() { fold[i % 8] ^= b }
+        var check = Data(fold)
+        check.append(contentsOf: Array(SHA256.hash(data: check).prefix(4))) // 12-byte check: 8 folded bytes + 4 bytes of their SHA-256
+
+        var body = Data()
+        Self.writeVint(0, into: &body) // version 0
+        Self.writeVint(1, into: &body) // flags: 1 = check value present, no MAC
+        body.append(UInt8(log2))
+        body.append(salt)
+        body.append(iv)
+        body.append(check)
+
+        var rec = Data()
+        Self.writeVint(UInt64(body.count + 1), into: &rec) // size including type vint
+        Self.writeVint(1, into: &rec) // type 1 = encryption
+        rec.append(body)
+        return rec
+    }
+
+    func addDirectory(name: String, mtime: Date, mode: UInt32) throws {
+        var body = Data()
+        let fileFlags: UInt64 = 1 | 2 // isDir (1) | mtime (2)
+        Self.writeVint(fileFlags, into: &body)
+        Self.writeVint(0, into: &body) // unpack size 0
+        Self.writeVint(UInt64(mode | 0o040000), into: &body) // S_IFDIR
+        let t = UInt32(mtime.timeIntervalSince1970)
+        body.append(UInt8(t & 0xff)); body.append(UInt8((t >> 8) & 0xff))
+        body.append(UInt8((t >> 16) & 0xff)); body.append(UInt8((t >> 24) & 0xff))
+        Self.writeVint(0, into: &body) // ci: method 0
+        Self.writeVint(1, into: &body) // hostOS: Unix (1)
+        let nameBytes = Data(name.utf8)
+        Self.writeVint(UInt64(nameBytes.count), into: &body)
+        body.append(nameBytes)
+        try out.write(Self.makeBlock(type: 2, flags: 0, body: body, dataSize: 0))      // an explicit empty data area, as RAR itself writes
+    }
+
+    func addSymlink(name: String, target: String, mtime: Date, mode: UInt32) throws {
+        var body = Data()
+        let fileFlags: UInt64 = 2 // mtime (2)
+        // Extra record: type 5 (link)
+        var extra = Data()
+        Self.writeVint(1, into: &extra) // link type: 1 = symlink
+        Self.writeVint(0, into: &extra) // link flags
+        let targetBytes = Data(target.utf8)
+        Self.writeVint(UInt64(targetBytes.count), into: &extra)
+        extra.append(targetBytes)
+        var extraRecord = Data()
+        Self.writeVint(UInt64(extra.count + 1), into: &extraRecord) // size of record including type vint
+        Self.writeVint(5, into: &extraRecord) // type 5
+        extraRecord.append(extra)
+
+        Self.writeVint(fileFlags, into: &body)
+        Self.writeVint(0, into: &body) // unpack size 0
+        Self.writeVint(UInt64(mode | 0o120000), into: &body) // S_IFLNK
+        let t = UInt32(mtime.timeIntervalSince1970)
+        body.append(UInt8(t & 0xff)); body.append(UInt8((t >> 8) & 0xff))
+        body.append(UInt8((t >> 16) & 0xff)); body.append(UInt8((t >> 24) & 0xff))
+        Self.writeVint(0, into: &body) // ci: method 0
+        Self.writeVint(1, into: &body) // hostOS: Unix (1)
+        let nameBytes = Data(name.utf8)
+        Self.writeVint(UInt64(nameBytes.count), into: &body)
+        body.append(nameBytes)
+        body.append(extraRecord)
+
+        try out.write(Self.makeBlock(type: 2, flags: 0, body: body, extraSize: UInt64(extraRecord.count), dataSize: 0))
+    }
+
+    func addFile(source: URL, name: String, size: UInt64, mtime: Date, mode: UInt32, progress: ProgressTracker?) throws {
+        let f = try FileIn(source)
+        var fileCrc: UInt32 = 0
+        var off: UInt64 = 0
+        while off < f.size {
+            let chunk = try f.read(at: off, 1 << 20)
+            if chunk.isEmpty { break }
+            fileCrc = CRC32.update(fileCrc, chunk)
+            off += UInt64(chunk.count)
+        }
+
+        var extraRecords = Data()
+        var encryptKey: Data?
+        var encryptIV: Data?
+        let packedSize: UInt64
+
+        if let pw = password, !pw.isEmpty {
+            var salt = [UInt8](repeating: 0, count: 16)
+            var iv = [UInt8](repeating: 0, count: 16)
+            _ = SecRandomCopyBytes(kSecRandomDefault, 16, &salt)
+            _ = SecRandomCopyBytes(kSecRandomDefault, 16, &iv)
+            let saltData = Data(salt)
+            let ivData = Data(iv)
+            let keys = try deriveKeys(salt: saltData, password: pw)
+            encryptKey = keys.key
+            encryptIV = ivData
+            extraRecords.append(makeEncRecord(salt: saltData, iv: ivData, checkKey: keys.check))
+            packedSize = (size + 15) & ~15
+        } else {
+            packedSize = size
+        }
+
+        var body = Data()
+        let fileFlags: UInt64 = 2 | 4 // mtime (2) | crc (4)
+        Self.writeVint(fileFlags, into: &body)
+        Self.writeVint(size, into: &body)
+        Self.writeVint(UInt64(mode | 0o100000), into: &body) // S_IFREG
+        let t = UInt32(mtime.timeIntervalSince1970)
+        body.append(UInt8(t & 0xff)); body.append(UInt8((t >> 8) & 0xff))
+        body.append(UInt8((t >> 16) & 0xff)); body.append(UInt8((t >> 24) & 0xff))
+        body.append(UInt8(fileCrc & 0xff)); body.append(UInt8((fileCrc >> 8) & 0xff))
+        body.append(UInt8((fileCrc >> 16) & 0xff)); body.append(UInt8((fileCrc >> 24) & 0xff))
+        Self.writeVint(0, into: &body) // ci: method 0 (store)
+        Self.writeVint(1, into: &body) // hostOS: Unix (1)
+        let nameBytes = Data(name.utf8)
+        Self.writeVint(UInt64(nameBytes.count), into: &body)
+        body.append(nameBytes)
+        if !extraRecords.isEmpty {
+            body.append(extraRecords)
+        }
+
+        let extraSize: UInt64? = extraRecords.isEmpty ? nil : UInt64(extraRecords.count)
+        try out.write(Self.makeBlock(type: 2, flags: 0, body: body, extraSize: extraSize, dataSize: packedSize))
+
+        if let key = encryptKey, let iv = encryptIV {
+            var cryptor: CCCryptorRef?
+            let st = key.withUnsafeBytes { k in
+                iv.withUnsafeBytes { v in
+                    CCCryptorCreate(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES), 0,
+                                    k.baseAddress, 32, v.baseAddress, &cryptor)
+                }
+            }
+            guard st == kCCSuccess, let crypt = cryptor else { throw AXError.io("AES encrypt init failed") }
+            defer { CCCryptorRelease(crypt) }
+
+            off = 0
+            var carry = Data()
+            while off < f.size {
+                try Task.checkCancellation()
+                let chunk = try f.read(at: off, 1 << 20)
+                if chunk.isEmpty { break }
+                off += UInt64(chunk.count)
+                try progress?.add(chunk.count)
+
+                let dataToEncrypt = carry + chunk
+                let usable = dataToEncrypt.count - (dataToEncrypt.count % 16)
+                carry = dataToEncrypt.suffix(dataToEncrypt.count - usable)
+                if usable > 0 {
+                    let toProcess = dataToEncrypt.prefix(usable)
+                    var cipher = Data(count: usable)
+                    var moved = 0
+                    let st = toProcess.withUnsafeBytes { i in
+                        cipher.withUnsafeMutableBytes { o in
+                            CCCryptorUpdate(crypt, i.baseAddress, usable, o.baseAddress, usable, &moved)
+                        }
+                    }
+                    guard st == kCCSuccess else { throw AXError.io("AES encryption failed") }
+                    try out.write(cipher.prefix(moved))
+                }
+            }
+            // Pad final block to 16 bytes with zeroes
+            if !carry.isEmpty || (packedSize > size && (packedSize - off) > 0) {
+                var lastBlock = carry
+                while lastBlock.count < 16 {
+                    lastBlock.append(0)
+                }
+                var cipher = Data(count: 16)
+                var moved = 0
+                let st = lastBlock.withUnsafeBytes { i in
+                    cipher.withUnsafeMutableBytes { o in
+                        CCCryptorUpdate(crypt, i.baseAddress, 16, o.baseAddress, 16, &moved)
+                    }
+                }
+                guard st == kCCSuccess else { throw AXError.io("AES encryption failed") }
+                try out.write(cipher.prefix(moved))
+            }
+        } else {
+            off = 0
+            while off < f.size {
+                try Task.checkCancellation()
+                let chunk = try f.read(at: off, 1 << 20)
+                if chunk.isEmpty { break }
+                try out.write(chunk)
+                off += UInt64(chunk.count)
+                try progress?.add(chunk.count)
+            }
+        }
+    }
+
+    func finish() throws {
+        var endBody = Data()
+        Self.writeVint(0, into: &endBody)
+        try out.write(Self.makeBlock(type: 5, flags: 0, body: endBody))
+        try out.finish()
+    }
 }

@@ -44,7 +44,9 @@ final class Inflater {
     private var lastBlock = false
     private var lit = HuffTable()
     private var dist = HuffTable()
-    private var window = [UInt8](repeating: 0, count: 32768)
+    private let deflate64: Bool
+    private var window: [UInt8]
+    private let wmask: Int
     private var wpos = 0
     private var total: UInt64 = 0
     private var chunk = [UInt8]()
@@ -61,7 +63,15 @@ final class Inflater {
         return (try! HuffTable(lengths: l), try! HuffTable(lengths: [UInt8](repeating: 5, count: 30)))
     }()
 
-    init() { chunk.reserveCapacity(1 << 17) }
+    /// `deflate64`: the Deflate64 variant (64 KB window, 16 extra bits on length code 285, distance codes 30 and 31).
+    private static let fixed64: HuffTable = try! HuffTable(lengths: [UInt8](repeating: 5, count: 32))
+
+    init(deflate64: Bool = false) {
+        self.deflate64 = deflate64
+        window = [UInt8](repeating: 0, count: deflate64 ? 65536 : 32768)
+        wmask = deflate64 ? 65535 : 32767
+        chunk.reserveCapacity(1 << 17)
+    }
 
     @inline(__always) private func refill() {
         while nbits <= 56 && ip < buf.count { bits |= UInt64(buf[ip]) << UInt64(nbits); nbits += 8; ip += 1 }
@@ -70,7 +80,7 @@ final class Inflater {
         let v = Int(bits & ((1 << UInt64(n)) - 1)); bits >>= UInt64(n); nbits -= n; return v
     }
     @inline(__always) private func put(_ b: UInt8) {
-        window[wpos] = b; wpos = (wpos + 1) & 32767; chunk.append(b)
+        window[wpos] = b; wpos = (wpos + 1) & wmask; chunk.append(b)
     }
     private func flush(_ sink: (Data) throws -> Void) throws {
         if !chunk.isEmpty { total &+= UInt64(chunk.count); try sink(Data(chunk)); chunk.removeAll(keepingCapacity: true) }
@@ -111,6 +121,12 @@ final class Inflater {
         dist = try HuffTable(lengths: Array(lengths[hlit...]))
     }
 
+    /// Starts a new deflate stream but keeps the last 32 KB of output as its dictionary (CAB "MSZIP" blocks work this way).
+    func restartKeepingWindow() {
+        buf.removeAll(); ip = 0; bits = 0; nbits = 0
+        state = .blockHeader; lastBlock = false; chunk.removeAll(keepingCapacity: true)
+    }
+
     /// Feeds more compressed bytes. `final` promises that no more input will follow.
     /// Returns whether the final block was completed and how many of `data`'s bytes were not used.
     @discardableResult
@@ -143,7 +159,7 @@ final class Inflater {
                     guard len == (~nlen & 0xffff) else { throw AXError.corrupt("stored block length mismatch") }
                     state = .stored(len)
                 case 1:
-                    lit = Inflater.fixed.0; dist = Inflater.fixed.1; state = .huffman
+                    lit = Inflater.fixed.0; dist = deflate64 ? Inflater.fixed64 : Inflater.fixed.1; state = .huffman
                 case 2:
                     try readDynamicTables(); state = .huffman
                 default:
@@ -174,13 +190,14 @@ final class Inflater {
                     else {
                         let li = sym - 257
                         guard li < 29 else { throw AXError.corrupt("invalid length code") }
-                        let length = Inflater.lenBase[li] + take(Inflater.lenExtra[li])
+                        let length = deflate64 && li == 28 ? 3 + take(16) : Inflater.lenBase[li] + take(Inflater.lenExtra[li])
                         let ds = try decode(dist)
-                        guard ds < 30 else { throw AXError.corrupt("invalid distance code") }
-                        let d = Inflater.distBase[ds] + take(Inflater.distExtra[ds])
-                        guard UInt64(d) <= total &+ UInt64(chunk.count), d <= 32768 else { throw AXError.corrupt("distance too far back") }
-                        var src = (wpos - d) & 32767
-                        for _ in 0..<length { let b = window[src]; src = (src + 1) & 32767; put(b) }
+                        guard ds < (deflate64 ? 32 : 30) else { throw AXError.corrupt("invalid distance code") }
+                        refill()
+                        let d = ds >= 30 ? (ds == 30 ? 32769 : 49153) + take(14) : Inflater.distBase[ds] + take(Inflater.distExtra[ds])
+                        guard UInt64(d) <= total &+ UInt64(chunk.count), d <= wmask + 1 else { throw AXError.corrupt("distance too far back") }
+                        var src = (wpos - d) & wmask
+                        for _ in 0..<length { let b = window[src]; src = (src + 1) & wmask; put(b) }
                     }
                     if chunk.count >= 1 << 16 { try flush(sink) }
                 }

@@ -1,4 +1,5 @@
 import Foundation
+import zlib
 
 // ArchiveX Core — our own archive engine. Everything under Sources/Core is original code;
 // the only external pieces it touches are Apple system frameworks (Foundation, Compression,
@@ -51,39 +52,70 @@ enum CRC32 {
     }
 
     static func update(_ crc: UInt32, _ data: Data) -> UInt32 {
-        var c = ~crc
-        data.withUnsafeBytes { raw in
-            table.withUnsafeBufferPointer { t in
-                for b in raw.bindMemory(to: UInt8.self) { c = t[Int((c ^ UInt32(b)) & 0xff)] ^ (c >> 8) }
-            }
+        guard !data.isEmpty else { return crc }
+        return data.withUnsafeBytes { raw in
+            UInt32(zlib.crc32(uLong(crc), raw.bindMemory(to: Bytef.self).baseAddress, uInt(raw.count)))
         }
-        return ~c
     }
 }
 
 // MARK: - File access (POSIX, so large files and random access are cheap)
 
 final class FileIn {
-    let fd: Int32
     let size: UInt64
     let url: URL
+    /// One entry per file; a split archive (name.7z.001, name.7z.002, …) reads as one continuous file.
+    private(set) var parts: [(fd: Int32, start: UInt64, size: UInt64, base: UInt64)] = []
+    let partURLs: [URL]
 
-    init(_ url: URL) throws {
-        self.url = url
-        fd = open(url.path, O_RDONLY)
-        guard fd >= 0 else { throw AXError.io("Can’t open “\(url.lastPathComponent)”: \(String(cString: strerror(errno)))") }
+    convenience init(_ url: URL) throws { try self.init(parts: [url], shownAs: url) }
+
+    init(parts urls: [URL], shownAs: URL) throws {
+        url = shownAs
+        partURLs = urls
+        var start: UInt64 = 0
+        for u in urls {
+            let fd = open(u.path, O_RDONLY)
+            guard fd >= 0 else {
+                for p in parts { close(p.fd) }
+                throw AXError.io("Can’t open “\(u.lastPathComponent)”: \(String(cString: strerror(errno)))")
+            }
+            var st = stat()
+            fstat(fd, &st)
+            parts.append((fd, start, UInt64(st.st_size), 0))
+            start += UInt64(st.st_size)
+        }
+        size = start
+    }
+    /// A window onto part of a file (a payload inside a package), readable like a file of its own.
+    init(window u: URL, offset: UInt64, length: UInt64) throws {
+        url = u
+        partURLs = [u]
+        let fd = open(u.path, O_RDONLY)
+        guard fd >= 0 else { throw AXError.io("Can’t open “\(u.lastPathComponent)”: \(String(cString: strerror(errno)))") }
         var st = stat()
         fstat(fd, &st)
-        size = UInt64(st.st_size)
+        let avail = UInt64(st.st_size) > offset ? UInt64(st.st_size) - offset : 0
+        let len = min(length, avail)
+        parts = [(fd, 0, len, offset)]
+        size = len
     }
-    deinit { close(fd) }
+    deinit { for p in parts { close(p.fd) } }
 
     func read(at offset: UInt64, _ count: Int) throws -> Data {
         guard count > 0 else { return Data() }
         var data = Data(count: count)
-        let n = data.withUnsafeMutableBytes { pread(fd, $0.baseAddress, count, off_t(offset)) }
-        if n < 0 { throw AXError.io("Read error: \(String(cString: strerror(errno)))") }
-        if n < count { data.removeSubrange(n..<count) }
+        var got = 0
+        var pos = offset
+        for p in parts where got < count && pos < p.start + p.size {
+            let inPart = pos - p.start
+            let want = min(count - got, Int(p.size - inPart))
+            let n = data.withUnsafeMutableBytes { pread(p.fd, $0.baseAddress! + got, want, off_t(inPart + p.base)) }
+            if n < 0 { throw AXError.io("Read error: \(String(cString: strerror(errno)))") }
+            got += n; pos += UInt64(n)
+            if n < want { break }
+        }
+        if got < count { data.removeSubrange(got..<count) }
         return data
     }
 
@@ -92,6 +124,49 @@ final class FileIn {
         let d = try read(at: offset, count)
         guard d.count == count else { throw AXError.corrupt("unexpected end of file") }
         return d
+    }
+
+    /// Opens an archive, joining the parts of a split set when `url` names one.
+    static func openArchive(_ url: URL) throws -> FileIn {
+        if let set = splitSet(for: url) ?? zipSpanSet(for: url) { return try FileIn(parts: set, shownAs: url) }
+        return try FileIn(url)
+    }
+
+    /// Info-ZIP style spanned archives: name.z01, name.z02, …, then name.zip last.
+    static func zipSpanSet(for url: URL) -> [URL]? {
+        let dir = url.deletingLastPathComponent()
+        let name = url.lastPathComponent
+        let ext = url.pathExtension.lowercased()
+        let base = (name as NSString).deletingPathExtension
+        guard ext == "zip" || (ext.count == 3 && ext.hasPrefix("z") && Int(ext.dropFirst()) != nil) else { return nil }
+        var out: [URL] = []
+        var i = 1
+        while true {
+            let u = dir.appendingPathComponent(base + ".z" + String(format: "%02d", i))
+            guard FileManager.default.fileExists(atPath: u.path) else { break }
+            out.append(u); i += 1
+        }
+        guard !out.isEmpty else { return nil }
+        let last = dir.appendingPathComponent(base + ".zip")
+        guard FileManager.default.fileExists(atPath: last.path) else { return nil }
+        return out + [last]
+    }
+
+    /// Finds the other parts of a split archive from the name of one of them (“x.7z.001”, “x.zip.002”, …).
+    static func splitSet(for url: URL) -> [URL]? {
+        let name = url.lastPathComponent
+        guard let dot = name.lastIndex(of: "."), name.distance(from: dot, to: name.endIndex) == 4,
+              let n = Int(name[name.index(after: dot)...]), n >= 1 else { return nil }
+        let base = String(name[..<dot])
+        let width = 3
+        var out: [URL] = []
+        var i = 1
+        while true {
+            let u = url.deletingLastPathComponent().appendingPathComponent(base + "." + String(format: "%0*d", width, i))
+            guard FileManager.default.fileExists(atPath: u.path) else { break }
+            out.append(u); i += 1
+        }
+        return out.isEmpty ? nil : out
     }
 }
 

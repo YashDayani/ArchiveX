@@ -33,6 +33,7 @@ func sh(_ cmd: String, cwd: URL? = nil) -> (status: Int32, out: String) {
 
 func q(_ u: URL) -> String { "'" + u.path.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
+let ZSTD: String? = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"].first { FileManager.default.isExecutableFile(atPath: $0) }
 let aesPWArg = "-p\"$(printf 's3cret-\\xc3\\xa9')\""   // exact UTF-8 bytes; Process() would hand 7-Zip a decomposed é
 let aesPW = "s3cret-\u{e9}"     // NFC, spelled with an escape so editors cannot change it
 
@@ -189,6 +190,48 @@ do {
     sh("\(SZ) a -bso0 -tzip \(q(foreign.appendingPathComponent("many.zip"))) .", cwd: many)
     let ml = try AXCore.list(foreign.appendingPathComponent("many.zip"), password: nil)
     check("read ZIP with 70 000 entries (ZIP64 directory)", ml.entries.filter { !$0.isDir }.count == 70000, "\(ml.entries.count)")
+
+    // other ZIP compression methods written by 7-Zip: Deflate64, bzip2, LZMA (also with AES), and a split set
+    let zm = work.appendingPathComponent("zipmethods"); try fm.createDirectory(at: zm, withIntermediateDirectories: true)
+    let zbig = work.appendingPathComponent("zipbig"); try fm.createDirectory(at: zbig, withIntermediateDirectories: true)
+    try Data((1...200_000).map { "row \($0): alpha beta gamma delta \($0 % 97)\n" }.joined().utf8).write(to: zbig.appendingPathComponent("big.txt"))
+    try Data((0..<(600 << 10)).map { _ in UInt8.random(in: 0...255) }).write(to: zbig.appendingPathComponent("noise.bin"))
+    for (label, args) in [("Deflate64", "-mm=Deflate64"), ("BZip2", "-mm=BZip2"), ("LZMA", "-mm=LZMA"), ("LZMA + AES", "-mm=LZMA -mem=AES256 -ppw456"),
+                          ("Deflate64 + AES", "-mm=Deflate64 -mem=AES256 -ppw456"), ("BZip2 + ZipCrypto", "-mm=BZip2 -mem=ZipCrypto -ppw456")] {
+        let id = label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: "+", with: "p")
+        let a = zm.appendingPathComponent("\(id).zip")
+        sh("\(SZ) a -bso0 -tzip \(args) \(q(a)) big.txt noise.bin", cwd: zbig)
+        let ref = work.appendingPathComponent("refz-\(id)")
+        let pw: String? = label.contains("+") ? "pw456" : nil
+        sh("\(SZ) x -y \(pw.map { "-p\($0)" } ?? "") -o\(q(ref)) \(q(a))")
+        do {
+            let ours = try extractOurs(a, to: "ownz-\(id)", password: pw)
+            check("zip [\(label)]: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+            try AXCore.test(a, password: pw, progress: { _ in })
+        } catch { check("zip [\(label)]", false, "\(error)") }
+    }
+    // Info-ZIP spanned archives (name.z01, name.z02, …, name.zip)
+    let zspan = work.appendingPathComponent("zipspan"); try fm.createDirectory(at: zspan, withIntermediateDirectories: true)
+    sh("/usr/bin/zip -q -s 150k -r \(q(zspan.appendingPathComponent("sp.zip"))) big.txt noise.bin", cwd: zbig)
+    if fm.fileExists(atPath: zspan.appendingPathComponent("sp.z02").path) {
+        let joined = zspan.appendingPathComponent("joined.zip")
+        sh("/usr/bin/zip -q -s 0 \(q(zspan.appendingPathComponent("sp.zip"))) --out \(q(joined))")
+        let ref = work.appendingPathComponent("refz-span"); sh("\(SZ) x -y -o\(q(ref)) \(q(joined))")
+        for opened in ["sp.zip", "sp.z01"] {
+            do {
+                let ours = try extractOurs(zspan.appendingPathComponent(opened), to: "ownz-span-\(opened)")
+                check("zip spanned (.z01 …) [open \(opened)]: matches 7-Zip's extraction of the joined archive", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+                try AXCore.test(zspan.appendingPathComponent(opened), password: nil, progress: { _ in })
+            } catch { check("zip spanned [\(opened)]", false, "\(error)") }
+        }
+    } else { check("zip spanned: the set was created", false) }
+    let zsplit = work.appendingPathComponent("zipsplit"); try fm.createDirectory(at: zsplit, withIntermediateDirectories: true)
+    sh("\(SZ) a -bso0 -tzip -v200k \(q(zsplit.appendingPathComponent("s.zip"))) big.txt noise.bin", cwd: zbig)
+    do {
+        let ref = work.appendingPathComponent("refz-split"); sh("\(SZ) x -y -o\(q(ref)) \(q(zsplit.appendingPathComponent("s.zip.001")))")
+        let ours = try extractOurs(zsplit.appendingPathComponent("s.zip.001"), to: "ownz-split")
+        check("zip split (.zip.001 …): matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+    } catch { check("zip split", false, "\(error)") }
 } catch { check("section 2 threw", false, "\(error)") }
 
 // MARK: 3. editing
@@ -529,11 +572,94 @@ do {
     // a BCJ-filtered archive must really contain the filter
     let bcjInfo = sh("\(SZ) l -slt \(q(foreign7.appendingPathComponent("f-bcj+lzma2.7z"))) | grep -i '^Method' | head -1").out
     check("7z read [bcj]: archive really uses the BCJ filter", bcjInfo.contains("BCJ"), bcjInfo)
-    // unsupported method fails cleanly
-    let ppmd = foreign7.appendingPathComponent("ppmd.7z")
-    sh("\(SZ) a -bso0 -t7z -m0=PPMd \(q(ppmd)) a.txt", cwd: src)
-    do { try AXCore.test(ppmd, password: nil, progress: { _ in }); check("7z PPMd: reported as unsupported", false) }
-    catch AXError.unsupported { check("7z PPMd: reported as unsupported", true) } catch { check("7z PPMd: reported as unsupported", false, "\(error)") }
+    // PPMd (text compression): orders, memory sizes (small sizes force the model to restart) and large mixed data
+    let pbig = work.appendingPathComponent("ppmdbig"); try fm.createDirectory(at: pbig, withIntermediateDirectories: true)
+    try Data((1...300_000).map { "line \($0): alpha beta gamma delta epsilon \($0 % 211)\n" }.joined().utf8).write(to: pbig.appendingPathComponent("big.txt"))
+    try Data((0..<(1 << 20)).map { _ in UInt8.random(in: 0...255) }).write(to: pbig.appendingPathComponent("noise.bin"))
+    try Data(contentsOf: URL(fileURLWithPath: "/usr/bin/curl")).write(to: pbig.appendingPathComponent("curl.bin"))
+    for (label, args) in [("default", "-m0=PPMd"), ("order 2", "-m0=PPMd:o=2"), ("order 32, 64 MB", "-m0=PPMd:o=32:mem=64m"), ("order 24, 16 MB", "-m0=PPMd:o=24:mem=16m"),
+                          ("1 MB (restarts)", "-m0=PPMd:o=8:mem=1m"), ("non-solid", "-m0=PPMd -ms=off"), ("encrypted", "-m0=PPMd \(aesPWArg)")] {
+        let a = foreign7.appendingPathComponent("p-\(label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: ",", with: "")).7z")
+        sh("\(SZ) a -bso0 -t7z \(args) \(q(a)) big.txt noise.bin curl.bin", cwd: pbig)
+        let pw = label == "encrypted"
+        let ref = ref7z(a, "p-\(label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: ",", with: ""))", pw: pw)
+        do {
+            let ours = try extractOurs(a, to: "x7p-\(label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: ",", with: ""))", password: pw ? aesPW : nil)
+            check("7z PPMd [\(label)]: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+            try AXCore.test(a, password: pw ? aesPW : nil, progress: { _ in })
+        } catch { check("7z PPMd [\(label)]", false, "\(error)") }
+    }
+    // the other branch filters (PowerPC, SPARC, ARM Thumb, Itanium, 32-bit ARM), in 7z and in xz, on data that triggers them
+    let bdir = work.appendingPathComponent("bcjdata"); try fm.createDirectory(at: bdir, withIntermediateDirectories: true)
+    var pattern = Data()
+    for i in 0..<60_000 {                // words that look like each architecture's call instructions, mixed with noise
+        pattern.append(contentsOf: [0x48, UInt8(i & 255), UInt8((i >> 8) & 255), 0x01])                              // PPC bl
+        pattern.append(contentsOf: [0x40, UInt8(i & 0x3f), UInt8((i * 7) & 255), UInt8((i * 3) & 255)])             // SPARC call
+        pattern.append(contentsOf: [UInt8(i & 255), 0xf0 | UInt8(i & 7), UInt8((i * 5) & 255), 0xf8 | UInt8((i >> 3) & 7)])  // Thumb bl
+        pattern.append(contentsOf: [UInt8(i & 255), UInt8((i >> 8) & 255), UInt8((i * 3) & 255), 0xeb])             // ARM bl
+        pattern.append(contentsOf: [UInt8.random(in: 0...255), UInt8.random(in: 0...255), UInt8.random(in: 0...255), UInt8.random(in: 0...255)])
+    }
+    for k in 0..<2000 { pattern.append(contentsOf: [0x10 | UInt8(k & 7) | 0x04, 0, 0, 0, 0, 0xa0, 0x03, 0x14, 0x01, 0x40, 0x02, 0, 0, 0, 0, 0]) }  // IA64-ish bundles
+    try pattern.write(to: bdir.appendingPathComponent("code.bin"))
+    for f in ["PPC", "SPARC", "ARMT", "ARM", "IA64"] {
+        let a = foreign7.appendingPathComponent("bcj-\(f).7z")
+        sh("\(SZ) a -bso0 -t7z -mf=\(f) \(q(a)) code.bin", cwd: bdir)
+        let info = sh("\(SZ) l -slt \(q(a)) | grep -i '^Method' | head -1").out
+        let ref = ref7z(a, "bcj-\(f)")
+        do {
+            let ours = try extractOurs(a, to: "x7bcj-\(f)")
+            check("7z \(f) filter: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+            check("7z \(f) filter: archive really uses it", info.uppercased().contains(f), info)
+        } catch { check("7z \(f) filter", false, "\(error)") }
+        let x = foreign7.appendingPathComponent("bcj-\(f).xz")
+        sh("\(SZ) a -bso0 -txz -mf=\(f) \(q(x)) code.bin", cwd: bdir)
+        do {
+            let ours = try extractOurs(x, to: "xzbcj-\(f)")
+            check("xz \(f) filter: round trip", (try? Data(contentsOf: ours.appendingPathComponent("bcj-\(f)"))) == pattern)
+        } catch { check("xz \(f) filter", false, "\(error)") }
+    }
+    // BCJ2 (four-stream x86 filter) on real x86-64 code, and a split archive (name.7z.001, …)
+    let xdir = work.appendingPathComponent("x86dir"); try fm.createDirectory(at: xdir, withIntermediateDirectories: true)
+    var haveX86 = false
+    for bin in ["/usr/bin/ssh", "/usr/bin/curl", "/usr/bin/git"] where fm.fileExists(atPath: bin) {
+        if sh("/usr/bin/lipo -thin x86_64 \(bin) -output \(q(xdir.appendingPathComponent((bin as NSString).lastPathComponent + ".x86")))").status == 0 { haveX86 = true }
+    }
+    if haveX86 {
+        for (label, args) in [("BCJ2", "-mf=BCJ2"), ("BCJ2 non-solid", "-mf=BCJ2 -ms=off"), ("BCJ2 + AES", "-mf=BCJ2 \(aesPWArg)")] {
+            let id = label.replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: "+", with: "p")
+            let a = foreign7.appendingPathComponent("b2-\(id).7z")
+            sh("\(SZ) a -bso0 -t7z \(args) \(q(a)) .", cwd: xdir)
+            let info = sh("\(SZ) l -slt \(q(a)) | grep -i '^Method' | head -1").out
+            let pw = label.contains("AES")
+            let ref = ref7z(a, "b2-\(id)", pw: pw)
+            do {
+                let ours = try extractOurs(a, to: "x7b2-\(id)", password: pw ? aesPW : nil)
+                check("7z BCJ2 [\(label)]: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+                try AXCore.test(a, password: pw ? aesPW : nil, progress: { _ in })
+            } catch { check("7z BCJ2 [\(label)]", false, "\(error)") }
+            if label == "BCJ2" { check("7z BCJ2: archive really uses BCJ2", info.contains("BCJ2"), info) }
+        }
+    }
+    let splitDir = work.appendingPathComponent("split7"); try fm.createDirectory(at: splitDir, withIntermediateDirectories: true)
+    sh("\(SZ) a -bso0 -t7z -v300k -mx=3 \(q(splitDir.appendingPathComponent("s.7z"))) big.txt noise.bin curl.bin", cwd: pbig)
+    let splitFirst = splitDir.appendingPathComponent("s.7z.001")
+    check("7z split: volumes were created", fm.fileExists(atPath: splitDir.appendingPathComponent("s.7z.003").path))
+    do {
+        let ref = ref7z(splitFirst, "split7")
+        for opened in ["s.7z.001", "s.7z.002"] {
+            let ours = try extractOurs(splitDir.appendingPathComponent(opened), to: "x7split-\(opened)")
+            check("7z split [open \(opened)]: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+        }
+        try AXCore.test(splitFirst, password: nil, progress: { _ in })
+    } catch { check("7z split", false, "\(error)") }
+
+    let ppmd = foreign7.appendingPathComponent("p-default.7z")
+    let ppmdInfo = sh("\(SZ) l -slt \(q(ppmd)) | grep -i '^Method' | head -1").out
+    check("7z PPMd: archive really uses PPMd", ppmdInfo.lowercased().contains("ppmd"), ppmdInfo)
+    var pb = try Data(contentsOf: ppmd); pb[pb.count / 2] ^= 0x5a
+    let pbad = work.appendingPathComponent("bad-ppmd.7z"); try pb.write(to: pbad)
+    var pdet = false; do { try AXCore.test(pbad, password: nil, progress: { _ in }) } catch { pdet = true }
+    check("7z PPMd: corrupted data is detected", pdet)
 
     // editing
     let ed = try make7z("edit.7z")
@@ -596,15 +722,15 @@ if CommandLine.arguments.count > 3 {
             if r.status != 0 { print("   (rar failed: \(r.out.suffix(120)))") }
             return a
         }
-        func check5(_ label: String, _ a: URL, pw: String? = nil, ref refSrc: URL? = nil) {
+        func check5(_ label: String, _ a: URL, pw: String? = nil, ref refSrc: URL? = nil, openAs: URL? = nil) {
             let refDir = work.appendingPathComponent("rref-\(label.replacingOccurrences(of: " ", with: "_"))")
             try? fm.createDirectory(at: refDir, withIntermediateDirectories: true)
             let pwArg = pw != nil ? "-p\(rarPW)" : "-p-"
             sh("\(UNRAR) x -y -o+ \(pwArg) \(q(a)) \(q(refDir))/")
             do {
-                let ours = try extractOurs(a, to: "rown-\(label.replacingOccurrences(of: " ", with: "_"))", password: pw)
+                let ours = try extractOurs(openAs ?? a, to: "rown-\(label.replacingOccurrences(of: " ", with: "_"))", password: pw)
                 check("rar5 [\(label)]: matches unrar's extraction", sameTree(refDir, ours) == nil, sameTree(refDir, ours) ?? "")
-                try AXCore.test(a, password: pw, progress: { _ in })
+                try AXCore.test(openAs ?? a, password: pw, progress: { _ in })
                 check("rar5 [\(label)]: integrity test passes", true)
             } catch { check("rar5 [\(label)]", false, "\(error)") }
         }
@@ -645,6 +771,23 @@ if CommandLine.arguments.count > 3 {
         // listing
         let l = try AXCore.list(rdir.appendingPathComponent("t-m3.rar"), password: nil)
         check("rar5 listing: names, sizes and folders", l.entries.contains { $0.path == "sub/b.txt" && $0.size == 6 } && l.entries.contains { $0.isDir && $0.path == "empty-dir" } && l.details.hasPrefix("RAR 5"), "\(l.details) \(l.entries.map(\.path).prefix(4))")
+        // multi-volume RAR 5 sets (.part1.rar, .part2.rar, …), plain, solid and encrypted
+        for (label, opts) in [("plain", "-m3"), ("solid", "-m5 -s"), ("store", "-m0"), ("encrypted", "-m3 -p\(rarPW)"), ("encrypted names", "-m3 -hp\(rarPW)")] {
+            let vd = rdir.appendingPathComponent("vol5-\(label.replacingOccurrences(of: " ", with: "_"))"); try fm.createDirectory(at: vd, withIntermediateDirectories: true)
+            sh("\(RAR) a -inul -ep1 \(opts) -v400k \(q(vd.appendingPathComponent("v.rar"))) big.txt noise.bin code.exe tone.wav", cwd: big)
+            let parts = ((try? fm.contentsOfDirectory(atPath: vd.path)) ?? []).filter { $0.hasSuffix(".rar") }.sorted()
+            check("rar5 volumes [\(label)]: the set was created", parts.count >= 3, "\(parts)")
+            guard let first = parts.first else { continue }
+            let pw: String? = label.hasPrefix("encrypted") ? aesPW : nil
+            check5("multi-volume \(label)", vd.appendingPathComponent(first), pw: pw)
+            if label == "plain", parts.count > 2 {
+                check5("multi-volume plain, opened from a later volume", vd.appendingPathComponent(first), openAs: vd.appendingPathComponent(parts[2]))
+                let gone = vd.appendingPathComponent(parts[1]); let kept = try Data(contentsOf: gone); try fm.removeItem(at: gone)
+                var failed = false; do { try AXCore.test(vd.appendingPathComponent(first), password: nil, progress: { _ in }) } catch { failed = true }
+                check("rar5 volumes: a missing volume is reported", failed)
+                try kept.write(to: gone)
+            }
+        }
         // corruption / truncation
         var rb = try Data(contentsOf: rdir.appendingPathComponent("b-big_mixed_m3.rar")); rb[rb.count / 2] ^= 0x33
         let bad = work.appendingPathComponent("bad.rar"); try rb.write(to: bad)
@@ -655,6 +798,131 @@ if CommandLine.arguments.count > 3 {
         var det2 = false; do { _ = try AXCore.list(trunc, password: nil); try AXCore.test(trunc, password: nil, progress: { _ in }) } catch { det2 = true }
         check("rar5: truncated archive is detected", det2)
     } catch { check("section 10 threw", false, "\(error)") }
+}
+
+// MARK: 10b. RAR 3/4 format (the older RAR format: -ma4)
+// RAR 7 can no longer create RAR 4 archives, so this section needs a fourth argument: a folder with a `rar` from the
+// 5.x/6.x line (for example 5.91). The newer `unrar` from the third argument is still the reference extractor.
+
+if CommandLine.arguments.count > 4 {
+    let RARDIR = CommandLine.arguments[3]
+    let rarPW = "\"$(printf 's3cret-\\xc3\\xa9')\""
+    let RAR = CommandLine.arguments[4] + "/rar", UNRAR = RARDIR + "/unrar"
+    do {
+        let rdir = work.appendingPathComponent("rar4"); try fm.createDirectory(at: rdir, withIntermediateDirectories: true)
+        let big = work.appendingPathComponent("rar4big"); try fm.createDirectory(at: big, withIntermediateDirectories: true)
+        try Data((1...400_000).map { "line \($0): alpha beta gamma delta epsilon \($0 % 211)\n" }.joined().utf8).write(to: big.appendingPathComponent("big.txt"))
+        try Data((0..<(2 << 20)).map { _ in UInt8.random(in: 0...255) }).write(to: big.appendingPathComponent("noise.bin"))
+        var x86 = Data([0x4d, 0x5a, 0x90, 0x00])
+        for i in 0..<300_000 { x86.append(contentsOf: [0x55, 0x8b, 0xec, 0xe8, UInt8(i & 0xff), UInt8((i >> 8) & 0xff), 0x00, i % 5 == 0 ? 0xff : 0x00, 0xe9, UInt8((i * 7) & 0xff), 0x01, 0x00, 0x00, 0xc3]) }
+        try x86.write(to: big.appendingPathComponent("code.exe"))
+        var wav = Data(); for i in 0..<400_000 { let v = Int16(truncatingIfNeeded: Int(sin(Double(i) / 20) * 9000)); wav.append(UInt8(truncatingIfNeeded: v)); wav.append(UInt8(truncatingIfNeeded: v >> 8)) }
+        try wav.write(to: big.appendingPathComponent("tone.wav"))
+        // a 24-bit bitmap with gradients and noise (RGB filter)
+        var bmp = Data([0x42, 0x4d]); let bw = 300, bh = 200
+        var pix = Data()
+        for y in 0..<bh { for x in 0..<bw { pix.append(contentsOf: [UInt8((x * 255 / bw + Int.random(in: 0...6)) & 255), UInt8((y * 255 / bh + Int.random(in: 0...6)) & 255), UInt8(((x + y) * 255 / (bw + bh) + Int.random(in: 0...6)) & 255)]) } }
+        func le32(_ v: Int) -> [UInt8] { [UInt8(v & 255), UInt8((v >> 8) & 255), UInt8((v >> 16) & 255), UInt8((v >> 24) & 255)] }
+        bmp.append(contentsOf: le32(54 + pix.count) + [0, 0, 0, 0] + le32(54) + le32(40) + le32(bw) + le32(bh) + [1, 0, 24, 0] + le32(0) + le32(pix.count) + le32(2835) + le32(2835) + le32(0) + le32(0))
+        bmp.append(pix)
+        try bmp.write(to: big.appendingPathComponent("pic.bmp"))
+
+        func rar4(_ name: String, _ opts: String, items: String, cwd: URL) -> URL {
+            let a = rdir.appendingPathComponent(name); try? fm.removeItem(at: a)
+            let r = sh("\(RAR) a -inul -ma4 -ep1 \(opts) \(q(a)) \(items)", cwd: cwd)
+            if r.status != 0 { print("   (rar failed: \(r.out.suffix(120)))") }
+            return a
+        }
+        func check4(_ label: String, _ a: URL, pw: String? = nil, openAs: URL? = nil) {
+            let id = label.replacingOccurrences(of: " ", with: "_")
+            let refDir = work.appendingPathComponent("r4ref-\(id)")
+            try? fm.createDirectory(at: refDir, withIntermediateDirectories: true)
+            let pwArg = pw != nil ? "-p\(rarPW)" : "-p-"
+            sh("\(UNRAR) x -y -o+ \(pwArg) \(q(a)) \(q(refDir))/")
+            let target = openAs ?? a
+            do {
+                let ours = try extractOurs(target, to: "r4own-\(id)", password: pw)
+                check("rar4 [\(label)]: matches unrar's extraction", sameTree(refDir, ours) == nil, sameTree(refDir, ours) ?? "")
+                try AXCore.test(target, password: pw, progress: { _ in })
+                check("rar4 [\(label)]: integrity test passes", true)
+            } catch { check("rar4 [\(label)]", false, "\(error)") }
+        }
+
+        let tree = "a.txt sub empty-dir empty.txt run.sh 'résumé 日本語 ✓.txt' '\(longDir)'"
+        for (label, opts) in [("store", "-m0"), ("m1", "-m1"), ("m2", "-m2"), ("m3", "-m3"), ("m4", "-m4"), ("m5", "-m5"), ("solid m3", "-m3 -s"), ("dict 64k", "-md64k"), ("dict 4m", "-md4m -m5"),
+                              ("with recovery record", "-rr3"), ("-ol symlinks", "-ol")] {
+            check4(label, rar4("t-\(label.replacingOccurrences(of: " ", with: "_")).rar", opts, items: tree, cwd: src))
+        }
+        for (label, opts) in [("big mixed m3", "-m3"), ("big mixed m5 solid", "-m5 -s"), ("big mixed m1", "-m1"), ("big mixed store", "-m0"),
+                              ("text PPMd", "-m3 -mct+"), ("text PPMd order 2", "-m3 -mc2:16t+"), ("text PPMd order 63", "-m5 -mc63:128t+"),
+                              ("text PPMd 1 MB (model restarts)", "-m3 -mc6:1t+"), ("PPMd solid", "-m3 -s -mct+"), ("PPMd and LZ mixed, solid", "-m5 -s -mct")] {
+            check4(label, rar4("b-\(label.replacingOccurrences(of: " ", with: "_")).rar", opts, items: "big.txt noise.bin code.exe tone.wav", cwd: big))
+        }
+        // the six standard filters
+        check4("filter: audio", rar4("f-audio.rar", "-m5 -mc2a+", items: "tone.wav", cwd: big))
+        check4("filter: delta", rar4("f-delta.rar", "-m3 -mc4d+", items: "tone.wav", cwd: big))
+        check4("filter: RGB", rar4("f-rgb.rar", "-m3 -mcc+", items: "pic.bmp", cwd: big))
+        check4("filter: x86 E8/E9", rar4("f-e8.rar", "-m3 -mce+", items: "code.exe", cwd: big))
+        check4("filter: Itanium", rar4("f-itanium.rar", "-m3 -mci+", items: "code.exe", cwd: big))
+        check4("filters, solid", rar4("f-all.rar", "-s -m5 -mcc+ -mca+ -mce+", items: "pic.bmp tone.wav code.exe", cwd: big))
+        for bin in ["/usr/bin/ssh", "/usr/bin/curl"] where fm.fileExists(atPath: bin) {
+            let thin = big.appendingPathComponent((bin as NSString).lastPathComponent + ".x86")
+            if sh("/usr/bin/lipo -thin x86_64 \(bin) -output \(q(thin))").status == 0 {
+                check4("x86-64 code \((bin as NSString).lastPathComponent)", rar4("x86-\((bin as NSString).lastPathComponent).rar", "-m5", items: q(thin), cwd: big))
+            }
+        }
+        // passwords (AES-128 with SHA-1 key derivation)
+        check4("password", rar4("pw.rar", "-m3 -p\(rarPW)", items: tree, cwd: src), pw: aesPW)
+        check4("password + encrypted headers", rar4("hp.rar", "-m3 -hp\(rarPW)", items: tree, cwd: src), pw: aesPW)
+        check4("password, store", rar4("pw0.rar", "-m0 -p\(rarPW)", items: "a.txt sub", cwd: src), pw: aesPW)
+        check4("password, big solid PPMd", rar4("pwb.rar", "-m3 -s -mct+ -p\(rarPW)", items: "big.txt noise.bin", cwd: big), pw: aesPW)
+        for name in ["pw.rar", "hp.rar"] {
+            do { _ = try AXCore.list(rdir.appendingPathComponent(name), password: nil); _ = try extractOurs(rdir.appendingPathComponent(name), to: "r4pw-none-\(name)"); check("rar4 \(name): missing password reported", false) }
+            catch AXError.passwordRequired { check("rar4 \(name): missing password reported", true) } catch { check("rar4 \(name): missing password reported", false, "\(error)") }
+            do { _ = try extractOurs(rdir.appendingPathComponent(name), to: "r4pw-bad-\(name)", password: "wrong"); check("rar4 \(name): wrong password rejected", false) }
+            catch AXError.wrongPassword { check("rar4 \(name): wrong password rejected", true) } catch { check("rar4 \(name): wrong password rejected", false, "\(error)") }
+        }
+        // multi-volume sets: new (.partNN.rar) and old (.rar, .r00, …) numbering
+        let vdir = rdir.appendingPathComponent("vol"); try fm.createDirectory(at: vdir, withIntermediateDirectories: true)
+        let vnew = vdir.appendingPathComponent("new.part01.rar")
+        sh("\(RAR) a -inul -ma4 -ep1 -m3 -v600k \(q(vdir.appendingPathComponent("new.rar"))) big.txt noise.bin code.exe", cwd: big)
+        check("rar4 volumes: the set was created", fm.fileExists(atPath: vdir.appendingPathComponent("new.part3.rar").path) || fm.fileExists(atPath: vdir.appendingPathComponent("new.part03.rar").path) || fm.fileExists(atPath: vnew.path))
+        if let first = (try? fm.contentsOfDirectory(atPath: vdir.path))?.filter({ $0.hasPrefix("new.part") }).sorted().first {
+            let f1 = vdir.appendingPathComponent(first)
+            check4("multi-volume (new numbering), open first volume", f1)
+            let parts = (try? fm.contentsOfDirectory(atPath: vdir.path))?.filter { $0.hasPrefix("new.part") }.sorted() ?? []
+            if parts.count > 1 { check4("multi-volume, open a later volume", f1, openAs: vdir.appendingPathComponent(parts[1])) }
+            if parts.count > 2 {
+                // a missing volume must be reported, not silently produce a short file
+                let gone = vdir.appendingPathComponent(parts[2]); let kept = try Data(contentsOf: gone)
+                try fm.removeItem(at: gone)
+                var failed = false; do { try AXCore.test(f1, password: nil, progress: { _ in }) } catch { failed = true }
+                check("rar4 volumes: a missing volume is reported", failed)
+                try kept.write(to: gone)
+            }
+        }
+        let odir = rdir.appendingPathComponent("oldvol"); try fm.createDirectory(at: odir, withIntermediateDirectories: true)
+        sh("\(RAR) a -inul -ma4 -ep1 -m3 -v500k -vn \(q(odir.appendingPathComponent("old.rar"))) big.txt code.exe", cwd: big)
+        check4("multi-volume (old numbering: .rar, .r00 …)", odir.appendingPathComponent("old.rar"))
+        // solid: pulling one file from the middle must still decode the files before it
+        let solidA = rdir.appendingPathComponent("b-big_mixed_m5_solid.rar")
+        let selDir = work.appendingPathComponent("rar4-sel")
+        try AXCore.extract(solidA, selection: [("tone.wav", false)], to: selDir, overwrite: .all, keepPaths: true, password: nil, progress: { _ in })
+        check("rar4 solid: extracting one file from the middle works", (try? Data(contentsOf: selDir.appendingPathComponent("tone.wav"))) == wav)
+        let l = try AXCore.list(rdir.appendingPathComponent("t-m3.rar"), password: nil)
+        check("rar4 listing: names, sizes and folders", l.entries.contains { $0.path == "sub/b.txt" && $0.size == 6 } && l.entries.contains { $0.isDir && $0.path == "empty-dir" } && l.entries.contains { $0.path == "résumé 日本語 ✓.txt" } && l.details.hasPrefix("RAR 4"), "\(l.details) \(l.entries.map(\.path).prefix(6))")
+        // corruption / truncation
+        for name in ["b-big_mixed_m3.rar", "b-text_PPMd.rar"] {
+            var rb = try Data(contentsOf: rdir.appendingPathComponent(name)); rb[rb.count / 2] ^= 0x33
+            let bad = work.appendingPathComponent("bad4-\(name)"); try rb.write(to: bad)
+            var det = false; do { try AXCore.test(bad, password: nil, progress: { _ in }) } catch { det = true }
+            check("rar4: corrupted data is detected (\(name))", det)
+            var rt = try Data(contentsOf: rdir.appendingPathComponent(name)); rt.removeLast(150_000)
+            let trunc = work.appendingPathComponent("trunc4-\(name)"); try rt.write(to: trunc)
+            var det2 = false; do { _ = try AXCore.list(trunc, password: nil); try AXCore.test(trunc, password: nil, progress: { _ in }) } catch { det2 = true }
+            check("rar4: truncated archive is detected (\(name))", det2)
+        }
+    } catch { check("section 10b threw", false, "\(error)") }
 }
 
 // MARK: 11. ISO 9660 and CPIO
@@ -727,6 +995,321 @@ do {
         } catch { check("cpio [\(fmtName)]", false, "\(error)") }
     }
 } catch { check("section 11 threw", false, "\(error)") }
+
+// MARK: 12. packages and legacy formats: ar/deb, compress (.Z), RPM, XAR/pkg, CAB
+
+do {
+    let pk = work.appendingPathComponent("pkg"); try fm.createDirectory(at: pk, withIntermediateDirectories: true)
+    func refExtract(_ archive: URL, _ name: String) -> URL {
+        let d = work.appendingPathComponent("refpk-\(name)"); try? fm.createDirectory(at: d, withIntermediateDirectories: true)
+        sh("/usr/bin/bsdtar -xf \(q(archive)) -C \(q(d))"); return d
+    }
+    // ar and Debian packages
+    let flat = work.appendingPathComponent("ar-src"); try fm.createDirectory(at: flat, withIntermediateDirectories: true)
+    sh("cp a.txt run.sh empty.txt 'résumé 日本語 ✓.txt' \(q(flat))/", cwd: src)
+    try Data((0..<100_000).map { _ in UInt8.random(in: 0...255) }).write(to: flat.appendingPathComponent("a-rather-long-member-name-for-ar.bin"))
+    let arFile = pk.appendingPathComponent("t.a")
+    sh("/usr/bin/ar rcS \(q(arFile)) a.txt run.sh empty.txt 'résumé 日本語 ✓.txt' a-rather-long-member-name-for-ar.bin", cwd: flat)
+    do {
+        let ours = try extractOurs(arFile, to: "own-ar")
+        check("ar: matches bsdtar's extraction (long names)", sameContent(refExtract(arFile, "ar"), ours) == nil, sameContent(refExtract(arFile, "ar"), ours) ?? "")
+        try AXCore.test(arFile, password: nil, progress: { _ in })
+    } catch { check("ar", false, "\(error)") }
+    let debDir = work.appendingPathComponent("deb-src"); try fm.createDirectory(at: debDir.appendingPathComponent("usr/bin"), withIntermediateDirectories: true)
+    try "2.0\n".write(to: debDir.appendingPathComponent("debian-binary"), atomically: true, encoding: .utf8)
+    try "Package: test\nVersion: 1\n".write(to: debDir.appendingPathComponent("control"), atomically: true, encoding: .utf8)
+    try "#!/bin/sh\necho hi\n".write(to: debDir.appendingPathComponent("usr/bin/hi"), atomically: true, encoding: .utf8)
+    sh("tar czf control.tar.gz control; tar czf data.tar.gz usr", cwd: debDir)
+    let deb = pk.appendingPathComponent("t.deb")
+    sh("/usr/bin/ar rcS \(q(deb)) debian-binary control.tar.gz data.tar.gz", cwd: debDir)
+    do {
+        let l = try AXCore.list(deb, password: nil)
+        check("deb: lists the three members", l.entries.map(\.path) == ["debian-binary", "control.tar.gz", "data.tar.gz"] && l.details.contains("Debian"), "\(l.entries.map(\.path)) \(l.details)")
+        let ours = try extractOurs(deb, to: "own-deb")
+        check("deb: members extract intact", (try? Data(contentsOf: ours.appendingPathComponent("data.tar.gz"))) == (try? Data(contentsOf: debDir.appendingPathComponent("data.tar.gz"))))
+    } catch { check("deb", false, "\(error)") }
+
+    // compress (.Z)
+    let zdir = work.appendingPathComponent("lzw"); try fm.createDirectory(at: zdir, withIntermediateDirectories: true)
+    try Data((1...150_000).map { "line \($0) of text with some repetition \($0 % 41)\n" }.joined().utf8).write(to: zdir.appendingPathComponent("text.txt"))
+    try Data((0..<200_000).map { _ in UInt8.random(in: 0...255) }).write(to: zdir.appendingPathComponent("noise.bin"))
+    try Data(repeating: 0x41, count: 500_000).write(to: zdir.appendingPathComponent("same.bin"))
+    try "x".write(to: zdir.appendingPathComponent("tiny.txt"), atomically: true, encoding: .utf8)
+    for (f, opts) in [("text.txt", ""), ("text.txt", "-b 12"), ("text.txt", "-b 9"), ("noise.bin", ""), ("same.bin", ""), ("tiny.txt", "")] {
+        let z = zdir.appendingPathComponent("\(f)-\(opts.replacingOccurrences(of: " ", with: "")).Z")
+        sh("/usr/bin/compress -c \(opts) \(f) > \(q(z))", cwd: zdir)
+        do {
+            let ours = try extractOurs(z, to: "own-z-\(z.lastPathComponent)")
+            let got = (try? Data(contentsOf: ours.appendingPathComponent(z.lastPathComponent.dropLast(2).description))) ?? Data()
+            check("compress .Z [\(f) \(opts)]: round trip", got == (try Data(contentsOf: zdir.appendingPathComponent(f))), "\(got.count) bytes")
+            try AXCore.test(z, password: nil, progress: { _ in })
+        } catch { check("compress .Z [\(f) \(opts)]", false, "\(error)") }
+    }
+
+    // RPM (built by hand: lead, signature header, header, compressed cpio payload)
+    func be32b(_ v: Int) -> [UInt8] { [UInt8((v >> 24) & 255), UInt8((v >> 16) & 255), UInt8((v >> 8) & 255), UInt8(v & 255)] }
+    func rpmHeader(_ entries: [(tag: Int, type: Int, off: Int, count: Int)], _ store: [UInt8]) -> [UInt8] {
+        var h: [UInt8] = [0x8e, 0xad, 0xe8, 0x01, 0, 0, 0, 0] + be32b(entries.count) + be32b(store.count)
+        for e in entries { h += be32b(e.tag) + be32b(e.type) + be32b(e.off) + be32b(e.count) }
+        return h + store
+    }
+    let rpmSrc = work.appendingPathComponent("rpm-src"); try fm.createDirectory(at: rpmSrc, withIntermediateDirectories: true)
+    sh("cp -R sub a.txt run.sh empty.txt empty-dir link-to-a \(q(rpmSrc))/", cwd: src)
+    let cpioNewc = pk.appendingPathComponent("payload.cpio")
+    sh("/usr/bin/bsdtar --format newc -cf \(q(cpioNewc)) a.txt sub run.sh link-to-a empty-dir empty.txt", cwd: rpmSrc)
+    let cpioRef = refExtract(cpioNewc, "rpm-cpio")
+    for (label, comp) in [("gzip", "gzip -c"), ("bzip2", "bzip2 -c"), ("xz", "xz7"), ("none", "cat")] + (ZSTD != nil ? [("zstd", "\(ZSTD!) -q -c")] : []) {
+        var payload: Data
+        if comp == "xz7" {
+            let x = pk.appendingPathComponent("payload.xz"); try? fm.removeItem(at: x)
+            sh("\(SZ) a -bso0 -txz \(q(x)) \(q(cpioNewc))"); payload = try Data(contentsOf: x)
+        } else {
+            let x = pk.appendingPathComponent("payload.\(label)")
+            sh("\(comp) \(q(cpioNewc)) > \(q(x))"); payload = try Data(contentsOf: x)
+        }
+        var rpm = Data([0xed, 0xab, 0xee, 0xdb, 3, 0, 0, 0, 0, 1])
+        rpm.append(Data("testpkg-1.0".utf8)); rpm.append(Data(repeating: 0, count: 66 - 11))
+        rpm.append(contentsOf: [0, 1, 0, 5]); rpm.append(Data(repeating: 0, count: 16))
+        var sig = rpmHeader([(1000, 4, 0, 1)], [0, 0, 0, 1]); while (96 + sig.count) % 8 != 0 { sig.append(0) }
+        rpm.append(contentsOf: sig)
+        rpm.append(contentsOf: rpmHeader([(1000, 6, 0, 1), (1001, 6, 7, 1)], Array("testpkg\0".utf8) + Array("1.0\0".utf8)).dropLast(0))
+        rpm.append(payload)
+        let rf = pk.appendingPathComponent("t-\(label).rpm"); try rpm.write(to: rf)
+        do {
+            let ours = try extractOurs(rf, to: "own-rpm-\(label)")
+            check("rpm [\(label)]: matches bsdtar's extraction of the payload", sameTree(cpioRef, ours) == nil, sameTree(cpioRef, ours) ?? "")
+            let l = try AXCore.list(rf, password: nil)
+            check("rpm [\(label)]: package name shown", l.details.contains("testpkg"), l.details)
+            try AXCore.test(rf, password: nil, progress: { _ in })
+        } catch { check("rpm [\(label)]", false, "\(error)") }
+    }
+
+    // XAR / pkg written by macOS's xar
+    for comp in ["none", "gzip", "bzip2"] {
+        let x = pk.appendingPathComponent("t-\(comp).xar"); try? fm.removeItem(at: x)
+        let mk = sh("/usr/bin/xar --compression=\(comp) -cf \(q(x)) a.txt sub run.sh link-to-a empty-dir empty.txt 'résumé 日本語 ✓.txt'", cwd: src)
+        if mk.status != 0 { check("xar [\(comp)]: created", false, mk.out.suffix(120).description); continue }
+        let ref = work.appendingPathComponent("refxar-\(comp)"); try fm.createDirectory(at: ref, withIntermediateDirectories: true)
+        sh("/usr/bin/xar -xf \(q(x)) -C \(q(ref))")
+        do {
+            let ours = try extractOurs(x, to: "own-xar-\(comp)")
+            check("xar [\(comp)]: matches xar's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+            try AXCore.test(x, password: nil, progress: { _ in })
+        } catch { check("xar [\(comp)]", false, "\(error)") }
+    }
+
+    // CAB (written here: stored and MSZIP), checked against 7-Zip
+    func cab(_ files: [(String, Data)], mszip: Bool) -> Data {
+        var all = Data(); for f in files { all.append(f.1) }
+        func le16b(_ v: Int) -> [UInt8] { [UInt8(v & 255), UInt8((v >> 8) & 255)] }
+        func le32b(_ v: Int) -> [UInt8] { le16b(v & 0xffff) + le16b(v >> 16) }
+        var blocks = Data(); var nBlocks = 0
+        var pos = 0
+        while pos < all.count || (pos == 0 && nBlocks == 0) {
+            let chunk = all.subdata(in: pos..<min(all.count, pos + 32768)); pos += max(chunk.count, 1)
+            var data = chunk
+            if mszip { data = Data([0x43, 0x4b]) + ((try? (chunk as NSData).compressed(using: .zlib) as Data) ?? chunk) }
+            blocks.append(contentsOf: le32b(0) + le16b(data.count) + le16b(chunk.count)); blocks.append(data); nBlocks += 1
+            if all.isEmpty { break }
+        }
+        var fileTable = Data(); var off = 0
+        for f in files {
+            fileTable.append(contentsOf: le32b(f.1.count) + le32b(off) + le16b(0) + le16b(0x5821) + le16b(0x6000) + le16b(0x20)); fileTable.append(Data(f.0.utf8)); fileTable.append(0)
+            off += f.1.count
+        }
+        let coffFiles = 36 + 8
+        let coffData = coffFiles + fileTable.count
+        var h = Data("MSCF".utf8) + Data(le32b(0)) + Data(le32b(coffData + blocks.count)) + Data(le32b(0)) + Data(le32b(coffFiles)) + Data(le32b(0))
+        h.append(contentsOf: [3, 1]); h.append(contentsOf: le16b(1) + le16b(files.count) + le16b(0) + le16b(0) + le16b(0))
+        h.append(contentsOf: le32b(coffData) + le16b(nBlocks) + le16b(mszip ? 1 : 0))
+        return h + fileTable + blocks
+    }
+    let cabFiles: [(String, Data)] = [("one.txt", Data("first file\n".utf8)), ("dir\\two.txt", Data((1...20000).map { "line \($0)\n" }.joined().utf8)),
+                                      ("empty.txt", Data()), ("noise.bin", Data((0..<100_000).map { _ in UInt8.random(in: 0...255) }))]
+    for mszip in [false, true] {
+        let c = pk.appendingPathComponent(mszip ? "t-mszip.cab" : "t-stored.cab"); try cab(cabFiles, mszip: mszip).write(to: c)
+        let ref = work.appendingPathComponent("refcab-\(mszip)"); try fm.createDirectory(at: ref, withIntermediateDirectories: true)
+        sh("\(SZ) x -y -o\(q(ref)) \(q(c))")
+        do {
+            let ours = try extractOurs(c, to: "own-cab-\(mszip)")
+            check("cab [\(mszip ? "MSZIP" : "stored")]: matches 7-Zip's extraction", sameContent(ref, ours) == nil, sameContent(ref, ours) ?? "")
+            check("cab [\(mszip ? "MSZIP" : "stored")]: bytes equal what was packed", (try? Data(contentsOf: ours.appendingPathComponent("dir/two.txt"))) == cabFiles[1].1)
+            try AXCore.test(c, password: nil, progress: { _ in })
+        } catch { check("cab [\(mszip ? "MSZIP" : "stored")]", false, "\(error)") }
+    }
+
+    // DMG disk images made by hdiutil (HFS+ inside), in several compressions and partition layouts
+    let dmgSrc = work.appendingPathComponent("dmg-src"); try fm.createDirectory(at: dmgSrc, withIntermediateDirectories: true)
+    sh("cp -R sub a.txt run.sh empty.txt empty-dir link-to-a 'résumé 日本語 ✓.txt' \(q(dmgSrc))/", cwd: src)
+    try fm.createDirectory(at: dmgSrc.appendingPathComponent("Deep Folder/Another Level"), withIntermediateDirectories: true)
+    try Data((0..<1_500_000).map { _ in UInt8.random(in: 0...255) }).write(to: dmgSrc.appendingPathComponent("Deep Folder/random.bin"))
+    try Data((1...120_000).map { "dmg line \($0) alpha beta gamma\n" }.joined().utf8).write(to: dmgSrc.appendingPathComponent("Deep Folder/Another Level/text.txt"))
+    sh("ln -f \(q(dmgSrc.appendingPathComponent("a.txt"))) \(q(dmgSrc.appendingPathComponent("hardlink-to-a.txt")))")
+    let dmgDir = work.appendingPathComponent("dmgs"); try fm.createDirectory(at: dmgDir, withIntermediateDirectories: true)
+    var dmgRef: URL?
+    for (label, fmt, layout) in [("UDZO", "UDZO", "SPUD"), ("UDRO", "UDRO", "SPUD"), ("UDBZ", "UDBZ", "SPUD"), ("ULFO", "ULFO", "SPUD"), ("ULMO", "ULMO", "SPUD"),
+                                 ("GPT layout", "UDZO", "GPTSPUD"), ("no partition map", "UDZO", "NONE")] {
+        let out = dmgDir.appendingPathComponent("t-\(label.replacingOccurrences(of: " ", with: "_")).dmg")
+        let mk = sh("/usr/bin/hdiutil create -quiet -srcfolder \(q(dmgSrc)) -fs HFS+ -volname DMGTEST -format \(fmt) -layout \(layout) \(q(out))")
+        if mk.status != 0 { check("dmg [\(label)]: created by hdiutil", false, mk.out.suffix(160).description); continue }
+        if dmgRef == nil {
+            // reference: let macOS mount the same image read-only and copy what it shows
+            let mnt = work.appendingPathComponent("dmg-mount"); try fm.createDirectory(at: mnt, withIntermediateDirectories: true)
+            if sh("/usr/bin/hdiutil attach -quiet -readonly -nobrowse -noverify -mountpoint \(q(mnt)) \(q(out))").status == 0 {
+                let r = work.appendingPathComponent("dmg-ref"); sh("/bin/cp -R \(q(mnt))/. \(q(r))/ 2>/dev/null; true")
+                try? fm.createDirectory(at: r, withIntermediateDirectories: true)
+                sh("/bin/cp -R \(q(mnt))/ \(q(r))/")
+                sh("/usr/bin/hdiutil detach -quiet -force \(q(mnt))")
+                dmgRef = r
+            }
+        }
+        do {
+            let ours = try extractOurs(out, to: "own-dmg-\(label.replacingOccurrences(of: " ", with: "_"))")
+            if let r = dmgRef { check("dmg [\(label)]: matches what macOS mounts", sameContent(r, ours) == nil, sameContent(r, ours) ?? "") }
+            check("dmg [\(label)]: bytes equal the source files", (try? Data(contentsOf: ours.appendingPathComponent("Deep Folder/random.bin"))) == (try? Data(contentsOf: dmgSrc.appendingPathComponent("Deep Folder/random.bin")))
+                  && (try? Data(contentsOf: ours.appendingPathComponent("hardlink-to-a.txt"))) == (try? Data(contentsOf: dmgSrc.appendingPathComponent("a.txt"))))
+            try AXCore.test(out, password: nil, progress: { _ in })
+            if label == "UDZO" { let l = try AXCore.list(out, password: nil); check("dmg: listing names the volume and format", l.details.contains("DMGTEST") && l.details.contains("zlib") && l.entries.contains { $0.path == "Deep Folder/Another Level/text.txt" }, l.details) }
+        } catch { check("dmg [\(label)]", false, "\(error)") }
+    }
+    // APFS volumes inside disk images (default GPT layout), checked against what macOS mounts
+    var apfsRef: URL?
+    for (label, fmt) in [("UDZO", "UDZO"), ("ULFO", "ULFO"), ("UDRO", "UDRO")] {
+        let out = dmgDir.appendingPathComponent("t-apfs-\(label).dmg")
+        let mk = sh("/usr/bin/hdiutil create -quiet -srcfolder \(q(dmgSrc)) -fs APFS -volname APFSTEST -format \(fmt) \(q(out))")
+        if mk.status != 0 { check("dmg APFS [\(label)]: created by hdiutil", false, mk.out.suffix(160).description); continue }
+        if apfsRef == nil {
+            let mnt = work.appendingPathComponent("apfs-mount"); try fm.createDirectory(at: mnt, withIntermediateDirectories: true)
+            if sh("/usr/bin/hdiutil attach -quiet -readonly -nobrowse -noverify -mountpoint \(q(mnt)) \(q(out))").status == 0 {
+                let r = work.appendingPathComponent("apfs-ref"); try fm.createDirectory(at: r, withIntermediateDirectories: true)
+                sh("/bin/cp -R \(q(mnt))/ \(q(r))/")
+                sh("/usr/bin/hdiutil detach -quiet -force \(q(mnt))")
+                apfsRef = r
+            }
+        }
+        do {
+            let ours = try extractOurs(out, to: "own-apfs-\(label)")
+            if let r = apfsRef { check("dmg APFS [\(label)]: matches what macOS mounts", sameContent(r, ours) == nil, sameContent(r, ours) ?? "") }
+            check("dmg APFS [\(label)]: bytes, symlink and hard link are right",
+                  (try? Data(contentsOf: ours.appendingPathComponent("Deep Folder/random.bin"))) == (try? Data(contentsOf: dmgSrc.appendingPathComponent("Deep Folder/random.bin")))
+                  && (try? Data(contentsOf: ours.appendingPathComponent("hardlink-to-a.txt"))) == (try? Data(contentsOf: dmgSrc.appendingPathComponent("a.txt")))
+                  && (try? fm.destinationOfSymbolicLink(atPath: ours.appendingPathComponent("link-to-a").path)) == "a.txt")
+            try AXCore.test(out, password: nil, progress: { _ in })
+            if label == "UDZO" { let l = try AXCore.list(out, password: nil); check("dmg APFS: listing names the volume and format", l.details.contains("APFSTEST") && l.details.contains("APFS"), l.details) }
+        } catch { check("dmg APFS [\(label)]", false, "\(error)") }
+    }
+    // transparently compressed files (decmpfs, stored in the resource fork) on an APFS volume
+    do {
+        let sparse = dmgDir.appendingPathComponent("cmp.sparseimage"); try? fm.removeItem(at: sparse)
+        let mnt = work.appendingPathComponent("apfs-cmp-mount"); try fm.createDirectory(at: mnt, withIntermediateDirectories: true)
+        let cs = work.appendingPathComponent("cmp-src"); try fm.createDirectory(at: cs, withIntermediateDirectories: true)
+        try Data((1...150_000).map { "compressible line \($0) \(["alpha", "beta", "gamma"][$0 % 3])\n" }.joined().utf8).write(to: cs.appendingPathComponent("big.txt"))
+        try Data((1...6000).map { "mid line \($0)\n" }.joined().utf8).write(to: cs.appendingPathComponent("mid.txt"))
+        if sh("/usr/bin/hdiutil create -quiet -size 80m -fs APFS -volname CMPTEST -type SPARSE \(q(sparse))").status == 0,
+           sh("/usr/bin/hdiutil attach -quiet -nobrowse -mountpoint \(q(mnt)) \(q(sparse))").status == 0 {
+            sh("/usr/bin/ditto --hfsCompression \(q(cs)) \(q(mnt))/")
+            let flags = sh("/bin/ls -lO \(q(mnt)) | grep -c compressed").out.trimmingCharacters(in: .whitespacesAndNewlines)
+            sh("/usr/bin/hdiutil detach -quiet -force \(q(mnt))")
+            let cdmg = dmgDir.appendingPathComponent("cmp.dmg"); try? fm.removeItem(at: cdmg)
+            sh("/usr/bin/hdiutil convert -quiet \(q(sparse)) -format UDZO -o \(q(cdmg))")
+            check("dmg APFS: test volume really holds compressed files", (Int(flags) ?? 0) >= 1, flags)
+            let ours = try extractOurs(cdmg, to: "own-apfs-cmp")
+            check("dmg APFS: transparently compressed files decode to the original bytes",
+                  (try? Data(contentsOf: ours.appendingPathComponent("big.txt"))) == (try? Data(contentsOf: cs.appendingPathComponent("big.txt")))
+                  && (try? Data(contentsOf: ours.appendingPathComponent("mid.txt"))) == (try? Data(contentsOf: cs.appendingPathComponent("mid.txt"))))
+            try AXCore.test(cdmg, password: nil, progress: { _ in })
+        }
+    } catch { check("dmg APFS compressed files", false, "\(error)") }
+    // the same on an HFS+ volume (the decmpfs header then lives in the attributes tree)
+    do {
+        let sparse = dmgDir.appendingPathComponent("hcmp.sparseimage"); try? fm.removeItem(at: sparse)
+        let mnt = work.appendingPathComponent("hfs-cmp-mount"); try fm.createDirectory(at: mnt, withIntermediateDirectories: true)
+        let cs = work.appendingPathComponent("cmp-src")
+        if sh("/usr/bin/hdiutil create -quiet -size 80m -fs HFS+ -volname HCMPTEST -type SPARSE \(q(sparse))").status == 0,
+           sh("/usr/bin/hdiutil attach -quiet -nobrowse -mountpoint \(q(mnt)) \(q(sparse))").status == 0 {
+            sh("/usr/bin/ditto --hfsCompression \(q(cs)) \(q(mnt))/")
+            let flags = sh("/bin/ls -lO \(q(mnt)) | grep -c compressed").out.trimmingCharacters(in: .whitespacesAndNewlines)
+            sh("/usr/bin/hdiutil detach -quiet -force \(q(mnt))")
+            let cdmg = dmgDir.appendingPathComponent("hcmp.dmg"); try? fm.removeItem(at: cdmg)
+            sh("/usr/bin/hdiutil convert -quiet \(q(sparse)) -format UDZO -o \(q(cdmg))")
+            check("dmg HFS+: test volume really holds compressed files", (Int(flags) ?? 0) >= 1, flags)
+            let ours = try extractOurs(cdmg, to: "own-hfs-cmp")
+            check("dmg HFS+: transparently compressed files decode to the original bytes",
+                  (try? Data(contentsOf: ours.appendingPathComponent("big.txt"))) == (try? Data(contentsOf: cs.appendingPathComponent("big.txt")))
+                  && (try? Data(contentsOf: ours.appendingPathComponent("mid.txt"))) == (try? Data(contentsOf: cs.appendingPathComponent("mid.txt"))))
+            try AXCore.test(cdmg, password: nil, progress: { _ in })
+        }
+    } catch { check("dmg HFS+ compressed files", false, "\(error)") }
+    if let anyDmg = (try? fm.contentsOfDirectory(atPath: dmgDir.path))?.first(where: { $0.hasPrefix("t-UDZO") }) {
+        var d = try Data(contentsOf: dmgDir.appendingPathComponent(anyDmg)); d.removeSubrange(d.count / 3..<d.count / 3 + 4000)
+        let bad = work.appendingPathComponent("bad.dmg"); try d.write(to: bad)
+        var det = false; do { try AXCore.test(bad, password: nil, progress: { _ in }) } catch { det = true }
+        check("dmg: damaged image is detected", det)
+    }
+
+    // Zstandard files and tar.zst written by the zstd tool (levels, checksums, long windows)
+    if let Z = ZSTD {
+        let zs = work.appendingPathComponent("zst"); try fm.createDirectory(at: zs, withIntermediateDirectories: true)
+        try Data((1...400_000).map { "record \($0): \(["alpha", "beta", "gamma", "delta"][$0 % 4]) \($0 % 997)\n" }.joined().utf8).write(to: zs.appendingPathComponent("text.txt"))
+        try Data((0..<(1 << 20)).map { _ in UInt8.random(in: 0...255) }).write(to: zs.appendingPathComponent("noise.bin"))
+        try Data(contentsOf: URL(fileURLWithPath: "/usr/bin/ssh")).write(to: zs.appendingPathComponent("code.bin"))
+        try "tiny".write(to: zs.appendingPathComponent("tiny.txt"), atomically: true, encoding: .utf8)
+        try Data().write(to: zs.appendingPathComponent("empty.txt"))
+        for f in ["text.txt", "noise.bin", "code.bin", "tiny.txt", "empty.txt"] {
+            for opts in ["-1", "-3", "-9", "-19", "-3 --no-check", "--long=27 -15", "-1 --fast=5"] {
+                let z = zs.appendingPathComponent("\(f).\(opts.replacingOccurrences(of: " ", with: "")).zst")
+                sh("\(Z) -q -f \(opts) \(f) -o \(q(z))", cwd: zs)
+                do {
+                    let ours = try extractOurs(z, to: "own-zst-\(z.lastPathComponent)")
+                    let got = (try? Data(contentsOf: ours.appendingPathComponent(String(z.lastPathComponent.dropLast(4))))) ?? Data()
+                    check("zstd [\(f) \(opts)]: round trip", got == (try Data(contentsOf: zs.appendingPathComponent(f))), "\(got.count) bytes")
+                } catch { check("zstd [\(f) \(opts)]", false, "\(error)") }
+            }
+        }
+        // concatenated frames and a skippable frame in between
+        let cat = zs.appendingPathComponent("cat.zst")
+        sh("(\(Z) -q -c tiny.txt; printf '\\x50\\x2a\\x4d\\x18\\x04\\x00\\x00\\x00abcd'; \(Z) -q -c text.txt) > \(q(cat))", cwd: zs)
+        do {
+            let ours = try extractOurs(cat, to: "own-zst-cat")
+            let got = (try? Data(contentsOf: ours.appendingPathComponent("cat"))) ?? Data()
+            check("zstd: concatenated and skippable frames", got == (try Data("tiny".utf8) + Data(contentsOf: zs.appendingPathComponent("text.txt"))), "\(got.count)")
+        } catch { check("zstd: concatenated frames", false, "\(error)") }
+        // tar.zst
+        let tz = zs.appendingPathComponent("t.tar.zst")
+        sh("/usr/bin/bsdtar -cf - a.txt sub run.sh link-to-a empty-dir empty.txt | \(Z) -q -f -o \(q(tz))", cwd: src)
+        let tref = work.appendingPathComponent("zst-tar-ref"); try fm.createDirectory(at: tref, withIntermediateDirectories: true)
+        sh("\(Z) -dc \(q(tz)) | /usr/bin/bsdtar -xf - -C \(q(tref))")
+        do {
+            let ours = try extractOurs(tz, to: "own-tarzst")
+            check("tar.zst: matches bsdtar's extraction", sameTree(tref, ours) == nil, sameTree(tref, ours) ?? "")
+            let l = try AXCore.list(tz, password: nil)
+            check("tar.zst: listing", l.details.contains("Zstandard") && l.entries.contains { $0.path == "sub/b.txt" }, l.details)
+        } catch { check("tar.zst", false, "\(error)") }
+        // damaged data must be detected (checksum or structure)
+        var zb = try Data(contentsOf: zs.appendingPathComponent("text.txt.-3.zst")); zb[zb.count / 2] ^= 0x41
+        let zbad = work.appendingPathComponent("bad.zst"); try zb.write(to: zbad)
+        var zdet = false; do { try AXCore.test(zbad, password: nil, progress: { _ in }) } catch { zdet = true }
+        check("zstd: damaged data is detected", zdet)
+        var zt = try Data(contentsOf: zs.appendingPathComponent("text.txt.-3.zst")); zt.removeLast(2000)
+        let ztr = work.appendingPathComponent("trunc.zst"); try zt.write(to: ztr)
+        var zdet2 = false; do { try AXCore.test(ztr, password: nil, progress: { _ in }) } catch { zdet2 = true }
+        check("zstd: truncated data is detected", zdet2)
+    }
+
+    // lzma-alone (.lzma) from the xz tool
+    if let XZ = ["/opt/homebrew/bin/xz", "/usr/local/bin/xz"].first(where: { fm.isExecutableFile(atPath: $0) }) {
+        for (f, opts) in [("text.txt", "-6"), ("text.txt", "-1"), ("noise.bin", "-3"), ("tiny.txt", "-6")] {
+            let zs = work.appendingPathComponent("zst")
+            let z = zs.appendingPathComponent("\(f).\(opts).lzma")
+            sh("\(XZ) --format=lzma -c \(opts) \(f) > \(q(z))", cwd: zs)
+            do {
+                let ours = try extractOurs(z, to: "own-lzma-\(f)\(opts)")
+                check("lzma-alone [\(f) \(opts)]: round trip", (try? Data(contentsOf: ours.appendingPathComponent("\(f).\(opts)"))) == (try Data(contentsOf: zs.appendingPathComponent(f))))
+                try AXCore.test(z, password: nil, progress: { _ in })
+            } catch { check("lzma-alone [\(f) \(opts)]", false, "\(error)") }
+        }
+    }
+} catch { check("section 12 threw", false, "\(error)") }
 
 print("\nRESULT: \(passed) passed, \(failed) failed")
 exit(failed == 0 ? 0 : 1)

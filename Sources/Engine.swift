@@ -84,23 +84,23 @@ func rows(from entries: [ArchiveEntry], in dir: String) -> [Row] {
 // MARK: - Formats
 
 enum ArchiveFormat: String, CaseIterable, Identifiable {
-    case sevenZ = "7z", zip = "ZIP", tar = "TAR"
+    case sevenZ = "7z", zip = "ZIP", rar = "RAR", tar = "TAR"
     case tgz = "TAR.GZ", tbz2 = "TAR.BZ2", txz = "TAR.XZ"
     var id: String { rawValue }
 
     var ext: String {
         switch self {
-        case .sevenZ: return "7z"; case .zip: return "zip"; case .tar: return "tar"
+        case .sevenZ: return "7z"; case .zip: return "zip"; case .rar: return "rar"; case .tar: return "tar"
         case .tgz: return "tar.gz"; case .tbz2: return "tar.bz2"; case .txz: return "tar.xz"
         }
     }
     var isTarCompressed: Bool { self == .tgz || self == .tbz2 || self == .txz }
-    var password: Bool { self == .sevenZ || self == .zip }
+    var password: Bool { self == .sevenZ || self == .zip || self == .rar }
     var headerEncryption: Bool { self == .sevenZ }
-    var level: Bool { self != .tar }
-    var solid: Bool { self == .sevenZ }
+    var level: Bool { self != .tar && self != .rar }
+    var solid: Bool { self == .sevenZ }                      // RAR files are written uncompressed, so “solid” would mean nothing
     /// Formats whose archives can have files added or removed in place.
-    var canUpdate: Bool { self == .sevenZ || self == .zip || self == .tar }
+    var canUpdate: Bool { self == .sevenZ || self == .zip || self == .tar || self == .rar }
 
     /// Extensions ArchiveX can open.
     static let knownExtensions: Set<String> = [
@@ -114,6 +114,7 @@ enum ArchiveFormat: String, CaseIterable, Identifiable {
         if n.hasSuffix(".7z") { return .sevenZ }
         if n.hasSuffix(".zip") || n.hasSuffix(".cbz") || n.hasSuffix(".jar") { return .zip }
         if n.hasSuffix(".tar") { return .tar }
+        if n.hasSuffix(".rar") { return .rar }
         return nil
     }
 

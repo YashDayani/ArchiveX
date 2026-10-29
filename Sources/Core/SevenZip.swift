@@ -15,13 +15,15 @@ private enum ID {
 private enum Method {
     static let copy: UInt64 = 0x00, delta: UInt64 = 0x03, bcjx86: UInt64 = 0x04, arm64: UInt64 = 0x0a
     static let lzma2: UInt64 = 0x21, lzma: UInt64 = 0x030101, ppmd: UInt64 = 0x030401
-    static let bcjx86Old: UInt64 = 0x03030103, armOld: UInt64 = 0x03030501
+    static let ppc: UInt64 = 0x05, ia64: UInt64 = 0x06, arm: UInt64 = 0x07, armt: UInt64 = 0x08, sparc: UInt64 = 0x09
+    static let ppcOld: UInt64 = 0x03030205, ia64Old: UInt64 = 0x03030401, armtOld: UInt64 = 0x03030701, sparcOld: UInt64 = 0x03030805
+    static let bcj2: UInt64 = 0x0303011b, bcjx86Old: UInt64 = 0x03030103, armOld: UInt64 = 0x03030501
     static let deflate: UInt64 = 0x040108, bzip2: UInt64 = 0x040202, aes: UInt64 = 0x06f10701
 
     static func name(_ id: UInt64) -> String {
         switch id {
-        case copy: return "Store"; case delta: return "Delta"; case bcjx86, bcjx86Old: return "BCJ"; case arm64: return "ARM64"
-        case armOld: return "ARM"; case lzma2: return "LZMA2"; case lzma: return "LZMA"; case ppmd: return "PPMd"
+        case copy: return "Store"; case bcj2: return "BCJ2"; case delta: return "Delta"; case bcjx86, bcjx86Old: return "BCJ"; case arm64: return "ARM64"
+        case armOld, arm: return "ARM"; case ppc, ppcOld: return "PPC"; case ia64, ia64Old: return "IA64"; case armt, armtOld: return "ARMT"; case sparc, sparcOld: return "SPARC"; case lzma2: return "LZMA2"; case lzma: return "LZMA"; case ppmd: return "PPMd"
         case deflate: return "Deflate"; case bzip2: return "BZip2"; case aes: return "AES-256"
         default: return "method " + String(id, radix: 16)
         }
@@ -296,7 +298,7 @@ final class SevenZipArchive {
     var folders: [SZFolder] { streams.folders }
 
     init(url: URL, password: String?) throws {
-        file = try FileIn(url)
+        file = try FileIn.openArchive(url)
         self.password = password
         try parse()
     }
@@ -468,7 +470,7 @@ final class SevenZipArchive {
     private func readFiles(_ r: inout HReader) throws {
         let n = Int(try r.number())
         var list = [SZFile](repeating: SZFile(), count: n)
-        var emptyStream = [Bool](repeating: false, count: n), emptyFile: [Bool] = [], anti: [Bool] = []
+        var emptyStream = [Bool](repeating: false, count: n), emptyFile: [Bool] = []
         while true {
             let t = Int(try r.number())
             if t == ID.end { break }
@@ -478,7 +480,7 @@ final class SevenZipArchive {
             switch t {
             case ID.emptyStream: emptyStream = try b.bitVector(n)
             case ID.emptyFile: emptyFile = try b.bitVector(emptyStream.filter { $0 }.count)
-            case ID.anti: anti = try b.bitVector(emptyStream.filter { $0 }.count)
+            case ID.anti: _ = try b.bitVector(emptyStream.filter { $0 }.count)
             case ID.names:
                 guard try b.byte() == 0 else { throw AXError.unsupported("external 7z names") }
                 let raw = b.d.subdata(in: b.d.startIndex + b.p..<b.d.endIndex)
@@ -534,19 +536,24 @@ final class SevenZipArchive {
         var ai = 0, ao = 0
         for c in f.coders { inBase.append(ai); outBase.append(ao); ai += c.numIn; ao += c.numOut }
 
+        func inputFor(_ inStream: Int) throws -> ByteSource {
+            if let bp = f.bind.first(where: { $0.inIdx == inStream }) { return try build(out: bp.outIdx) }
+            guard let pi = f.packed.firstIndex(of: inStream), f.firstPack + pi < info.packSizes.count else { throw AXError.corrupt("bad 7z pack stream") }
+            let idx = f.firstPack + pi
+            guard packOffset(info, idx) + info.packSizes[idx] <= file.size else { throw AXError.corrupt("7z data out of range (truncated archive?)") }
+            return RangeSource(file: file, offset: packOffset(info, idx), length: info.packSizes[idx])
+        }
+
         func build(out: Int) throws -> ByteSource {
             guard let ci = (0..<f.coders.count).last(where: { outBase[$0] <= out }) else { throw AXError.corrupt("bad 7z folder graph") }
             let c = f.coders[ci]
-            guard c.numIn == 1, c.numOut == 1 else { throw AXError.unsupported("7z method \(Method.name(c.id)) (multi-stream)") }
-            let inStream = inBase[ci]
-            let input: ByteSource
-            if let bp = f.bind.first(where: { $0.inIdx == inStream }) { input = try build(out: bp.outIdx) }
-            else {
-                guard let pi = f.packed.firstIndex(of: inStream), f.firstPack + pi < info.packSizes.count else { throw AXError.corrupt("bad 7z pack stream") }
-                let idx = f.firstPack + pi
-                guard packOffset(info, idx) + info.packSizes[idx] <= file.size else { throw AXError.corrupt("7z data out of range (truncated archive?)") }
-                input = RangeSource(file: file, offset: packOffset(info, idx), length: info.packSizes[idx])
+            if c.id == Method.bcj2 {
+                guard c.numIn == 4, c.numOut == 1 else { throw AXError.corrupt("bad BCJ2 coder") }
+                return Bcj2Source(main: try inputFor(inBase[ci]), call: try inputFor(inBase[ci] + 1), jump: try inputFor(inBase[ci] + 2),
+                                  rc: try inputFor(inBase[ci] + 3), outSize: f.unpack[out])
             }
+            guard c.numIn == 1, c.numOut == 1 else { throw AXError.unsupported("7z method \(Method.name(c.id)) (multi-stream)") }
+            let input = try inputFor(inBase[ci])
             let size = f.unpack[out]
             switch c.id {
             case Method.copy: return input
@@ -555,10 +562,15 @@ final class SevenZipArchive {
                 return try Lzma2Source(input: input, dictProp: p, sizeHint: size)
             case Method.lzma: return try LzmaSource(input: input, props: c.props, unpackSize: size)
             case Method.bzip2: return try Bzip2Source(source: input)
+            case Method.ppmd: return try PpmdSource(input: input, props: c.props, unpackSize: size)
             case Method.deflate: return InflateSource(input: input)
             case Method.bcjx86, Method.bcjx86Old: return FilterSource(input: input, filter: BCJx86())
             case Method.arm64: return FilterSource(input: input, filter: BCJARM64())
-            case Method.armOld: return FilterSource(input: input, filter: BCJARM())
+            case Method.armOld, Method.arm: return FilterSource(input: input, filter: BCJARM())
+            case Method.ppc, Method.ppcOld: return FilterSource(input: input, filter: BCJPPC())
+            case Method.ia64, Method.ia64Old: return FilterSource(input: input, filter: BCJIA64())
+            case Method.armt, Method.armtOld: return FilterSource(input: input, filter: BCJARMT())
+            case Method.sparc, Method.sparcOld: return FilterSource(input: input, filter: BCJSPARC())
             case Method.delta: return FilterSource(input: input, filter: DeltaFilter(distance: Int(c.props.first ?? 0) + 1))
             case Method.aes: return try SevenAESSource(input: input, props: c.props, password: password, unpackSize: size)
             default: throw AXError.unsupported("7z compression method “\(Method.name(c.id))”")
