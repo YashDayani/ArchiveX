@@ -1,6 +1,7 @@
 import Foundation
 import CommonCrypto
 import CryptoKit
+import zlib
 
 // RAR 5.0 reader (decompression only). Written from the public RAR 5.0 format description.
 // ArchiveX never creates RAR files: RARLAB's license reserves the compression algorithm.
@@ -812,4 +813,286 @@ struct RarVint {
     }
     mutating func u32() throws -> UInt32 { try bytes(4).le32(0) }
     mutating func u64() throws -> UInt64 { try bytes(8).le64(0) }
+}
+
+// MARK: - Native Pure-Swift RAR 5 Writer
+
+final class Rar5Writer {
+    private let out: FileOut
+    private let solid: Bool
+    private let password: String?
+    private let log2: Int = 15 // 32,768 PBKDF2 rounds
+
+    init(url: URL, solid: Bool = true, password: String? = nil) throws {
+        self.out = try FileOut(url)
+        self.solid = solid
+        self.password = (password?.isEmpty ?? true) ? nil : password
+        // Write RAR 5 signature (8 bytes)
+        try out.write(Data([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]))
+        // Write Main Archive Header: type 1, flags 0, archive flags: (solid ? 4 : 0)
+        var body = Data()
+        Self.writeVint(solid ? 4 : 0, into: &body)
+        try out.write(Self.makeBlock(type: 1, flags: 0, body: body))
+    }
+
+    static func writeVint(_ val: UInt64, into data: inout Data) {
+        var v = val
+        while true {
+            var b = UInt8(v & 0x7f)
+            v >>= 7
+            if v > 0 {
+                b |= 0x80
+                data.append(b)
+            } else {
+                data.append(b)
+                break
+            }
+        }
+    }
+
+    static func makeBlock(type: UInt64, flags: UInt64, body: Data, extraSize: UInt64? = nil, dataSize: UInt64? = nil) -> Data {
+        var hdr = Data()
+        writeVint(type, into: &hdr)
+        var fl = flags
+        if extraSize != nil { fl |= 1 }
+        if dataSize != nil { fl |= 2 }
+        writeVint(fl, into: &hdr)
+        if let es = extraSize {
+            writeVint(es, into: &hdr)
+        }
+        if let ds = dataSize {
+            writeVint(ds, into: &hdr)
+        }
+        hdr.append(body)
+
+        var sizeBytes = Data()
+        writeVint(UInt64(hdr.count), into: &sizeBytes)
+
+        var payload = sizeBytes
+        payload.append(hdr)
+
+        var c: UInt32 = 0
+        payload.withUnsafeBytes { raw in
+            c = UInt32(zlib.crc32(uLong(c), raw.bindMemory(to: Bytef.self).baseAddress, uInt(raw.count)))
+        }
+
+        var block = Data()
+        block.append(UInt8(c & 0xff))
+        block.append(UInt8((c >> 8) & 0xff))
+        block.append(UInt8((c >> 16) & 0xff))
+        block.append(UInt8((c >> 24) & 0xff))
+        block.append(payload)
+        return block
+    }
+
+    private func deriveKeys(salt: Data, password: String) throws -> (key: Data, hashKey: Data, check: Data) {
+        let pwb = Array(password.utf8)
+        func pbkdf(_ rounds: UInt32) throws -> Data {
+            var out = [UInt8](repeating: 0, count: 32)
+            let st = salt.withUnsafeBytes { s in
+                CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2), pwb.map { Int8(bitPattern: $0) }, pwb.count,
+                                     s.bindMemory(to: UInt8.self).baseAddress, salt.count,
+                                     CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256), rounds, &out, 32)
+            }
+            guard st == kCCSuccess else { throw AXError.io("Key derivation failed.") }
+            return Data(out)
+        }
+        let n = UInt32(1) << UInt32(log2)
+        return (try pbkdf(n), try pbkdf(n + 16), try pbkdf(n + 32))
+    }
+
+    private func makeEncRecord(salt: Data, iv: Data, checkKey: Data) -> Data {
+        var fold = [UInt8](repeating: 0, count: 8)
+        for (i, b) in checkKey.enumerated() { fold[i % 8] ^= b }
+        var check = Data(fold)
+        check.append(contentsOf: Array(SHA256.hash(data: check).prefix(4))) // 12-byte check: 8 folded bytes + 4 bytes of their SHA-256
+
+        var body = Data()
+        Self.writeVint(0, into: &body) // version 0
+        Self.writeVint(1, into: &body) // flags: 1 = check value present, no MAC
+        body.append(UInt8(log2))
+        body.append(salt)
+        body.append(iv)
+        body.append(check)
+
+        var rec = Data()
+        Self.writeVint(UInt64(body.count + 1), into: &rec) // size including type vint
+        Self.writeVint(1, into: &rec) // type 1 = encryption
+        rec.append(body)
+        return rec
+    }
+
+    func addDirectory(name: String, mtime: Date, mode: UInt32) throws {
+        var body = Data()
+        let fileFlags: UInt64 = 1 | 2 // isDir (1) | mtime (2)
+        Self.writeVint(fileFlags, into: &body)
+        Self.writeVint(0, into: &body) // unpack size 0
+        Self.writeVint(UInt64(mode | 0o040000), into: &body) // S_IFDIR
+        let t = UInt32(mtime.timeIntervalSince1970)
+        body.append(UInt8(t & 0xff)); body.append(UInt8((t >> 8) & 0xff))
+        body.append(UInt8((t >> 16) & 0xff)); body.append(UInt8((t >> 24) & 0xff))
+        Self.writeVint(0, into: &body) // ci: method 0
+        Self.writeVint(1, into: &body) // hostOS: Unix (1)
+        let nameBytes = Data(name.utf8)
+        Self.writeVint(UInt64(nameBytes.count), into: &body)
+        body.append(nameBytes)
+        try out.write(Self.makeBlock(type: 2, flags: 0, body: body, dataSize: 0))      // an explicit empty data area, as RAR itself writes
+    }
+
+    func addSymlink(name: String, target: String, mtime: Date, mode: UInt32) throws {
+        var body = Data()
+        let fileFlags: UInt64 = 2 // mtime (2)
+        // Extra record: type 5 (link)
+        var extra = Data()
+        Self.writeVint(1, into: &extra) // link type: 1 = symlink
+        Self.writeVint(0, into: &extra) // link flags
+        let targetBytes = Data(target.utf8)
+        Self.writeVint(UInt64(targetBytes.count), into: &extra)
+        extra.append(targetBytes)
+        var extraRecord = Data()
+        Self.writeVint(UInt64(extra.count + 1), into: &extraRecord) // size of record including type vint
+        Self.writeVint(5, into: &extraRecord) // type 5
+        extraRecord.append(extra)
+
+        Self.writeVint(fileFlags, into: &body)
+        Self.writeVint(0, into: &body) // unpack size 0
+        Self.writeVint(UInt64(mode | 0o120000), into: &body) // S_IFLNK
+        let t = UInt32(mtime.timeIntervalSince1970)
+        body.append(UInt8(t & 0xff)); body.append(UInt8((t >> 8) & 0xff))
+        body.append(UInt8((t >> 16) & 0xff)); body.append(UInt8((t >> 24) & 0xff))
+        Self.writeVint(0, into: &body) // ci: method 0
+        Self.writeVint(1, into: &body) // hostOS: Unix (1)
+        let nameBytes = Data(name.utf8)
+        Self.writeVint(UInt64(nameBytes.count), into: &body)
+        body.append(nameBytes)
+        body.append(extraRecord)
+
+        try out.write(Self.makeBlock(type: 2, flags: 0, body: body, extraSize: UInt64(extraRecord.count), dataSize: 0))
+    }
+
+    func addFile(source: URL, name: String, size: UInt64, mtime: Date, mode: UInt32, progress: ProgressTracker?) throws {
+        let f = try FileIn(source)
+        var fileCrc: UInt32 = 0
+        var off: UInt64 = 0
+        while off < f.size {
+            let chunk = try f.read(at: off, 1 << 20)
+            if chunk.isEmpty { break }
+            fileCrc = CRC32.update(fileCrc, chunk)
+            off += UInt64(chunk.count)
+        }
+
+        var extraRecords = Data()
+        var encryptKey: Data?
+        var encryptIV: Data?
+        let packedSize: UInt64
+
+        if let pw = password, !pw.isEmpty {
+            var salt = [UInt8](repeating: 0, count: 16)
+            var iv = [UInt8](repeating: 0, count: 16)
+            _ = SecRandomCopyBytes(kSecRandomDefault, 16, &salt)
+            _ = SecRandomCopyBytes(kSecRandomDefault, 16, &iv)
+            let saltData = Data(salt)
+            let ivData = Data(iv)
+            let keys = try deriveKeys(salt: saltData, password: pw)
+            encryptKey = keys.key
+            encryptIV = ivData
+            extraRecords.append(makeEncRecord(salt: saltData, iv: ivData, checkKey: keys.check))
+            packedSize = (size + 15) & ~15
+        } else {
+            packedSize = size
+        }
+
+        var body = Data()
+        let fileFlags: UInt64 = 2 | 4 // mtime (2) | crc (4)
+        Self.writeVint(fileFlags, into: &body)
+        Self.writeVint(size, into: &body)
+        Self.writeVint(UInt64(mode | 0o100000), into: &body) // S_IFREG
+        let t = UInt32(mtime.timeIntervalSince1970)
+        body.append(UInt8(t & 0xff)); body.append(UInt8((t >> 8) & 0xff))
+        body.append(UInt8((t >> 16) & 0xff)); body.append(UInt8((t >> 24) & 0xff))
+        body.append(UInt8(fileCrc & 0xff)); body.append(UInt8((fileCrc >> 8) & 0xff))
+        body.append(UInt8((fileCrc >> 16) & 0xff)); body.append(UInt8((fileCrc >> 24) & 0xff))
+        Self.writeVint(0, into: &body) // ci: method 0 (store)
+        Self.writeVint(1, into: &body) // hostOS: Unix (1)
+        let nameBytes = Data(name.utf8)
+        Self.writeVint(UInt64(nameBytes.count), into: &body)
+        body.append(nameBytes)
+        if !extraRecords.isEmpty {
+            body.append(extraRecords)
+        }
+
+        let extraSize: UInt64? = extraRecords.isEmpty ? nil : UInt64(extraRecords.count)
+        try out.write(Self.makeBlock(type: 2, flags: 0, body: body, extraSize: extraSize, dataSize: packedSize))
+
+        if let key = encryptKey, let iv = encryptIV {
+            var cryptor: CCCryptorRef?
+            let st = key.withUnsafeBytes { k in
+                iv.withUnsafeBytes { v in
+                    CCCryptorCreate(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES), 0,
+                                    k.baseAddress, 32, v.baseAddress, &cryptor)
+                }
+            }
+            guard st == kCCSuccess, let crypt = cryptor else { throw AXError.io("AES encrypt init failed") }
+            defer { CCCryptorRelease(crypt) }
+
+            off = 0
+            var carry = Data()
+            while off < f.size {
+                try Task.checkCancellation()
+                let chunk = try f.read(at: off, 1 << 20)
+                if chunk.isEmpty { break }
+                off += UInt64(chunk.count)
+                try progress?.add(chunk.count)
+
+                let dataToEncrypt = carry + chunk
+                let usable = dataToEncrypt.count - (dataToEncrypt.count % 16)
+                carry = dataToEncrypt.suffix(dataToEncrypt.count - usable)
+                if usable > 0 {
+                    let toProcess = dataToEncrypt.prefix(usable)
+                    var cipher = Data(count: usable)
+                    var moved = 0
+                    let st = toProcess.withUnsafeBytes { i in
+                        cipher.withUnsafeMutableBytes { o in
+                            CCCryptorUpdate(crypt, i.baseAddress, usable, o.baseAddress, usable, &moved)
+                        }
+                    }
+                    guard st == kCCSuccess else { throw AXError.io("AES encryption failed") }
+                    try out.write(cipher.prefix(moved))
+                }
+            }
+            // Pad final block to 16 bytes with zeroes
+            if !carry.isEmpty || (packedSize > size && (packedSize - off) > 0) {
+                var lastBlock = carry
+                while lastBlock.count < 16 {
+                    lastBlock.append(0)
+                }
+                var cipher = Data(count: 16)
+                var moved = 0
+                let st = lastBlock.withUnsafeBytes { i in
+                    cipher.withUnsafeMutableBytes { o in
+                        CCCryptorUpdate(crypt, i.baseAddress, 16, o.baseAddress, 16, &moved)
+                    }
+                }
+                guard st == kCCSuccess else { throw AXError.io("AES encryption failed") }
+                try out.write(cipher.prefix(moved))
+            }
+        } else {
+            off = 0
+            while off < f.size {
+                try Task.checkCancellation()
+                let chunk = try f.read(at: off, 1 << 20)
+                if chunk.isEmpty { break }
+                try out.write(chunk)
+                off += UInt64(chunk.count)
+                try progress?.add(chunk.count)
+            }
+        }
+    }
+
+    func finish() throws {
+        var endBody = Data()
+        Self.writeVint(0, into: &endBody)
+        try out.write(Self.makeBlock(type: 5, flags: 0, body: endBody))
+        try out.finish()
+    }
 }

@@ -358,6 +358,23 @@ enum AXCore {
         try w.finish()
     }
 
+    private static func writeRar(items: [AXItem], to tmp: URL, spec: AXCreate, progress: ProgressTracker) throws {
+        let w = try Rar5Writer(url: tmp, solid: false, password: spec.password)
+        for it in items {
+            try Task.checkCancellation()
+            switch it.kind {
+            case .dir:
+                try w.addDirectory(name: it.name, mtime: it.mtime, mode: it.mode)
+            case .symlink:
+                let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: it.url.path)) ?? ""
+                try w.addSymlink(name: it.name, target: target, mtime: it.mtime, mode: it.mode)
+            case .file:
+                try w.addFile(source: it.url, name: it.name, size: it.size, mtime: it.mtime, mode: it.mode, progress: progress)
+            }
+        }
+        try w.finish()
+    }
+
     private static func write(items: [AXItem], format: ArchiveFormat, to tmp: URL, level: Int, password: String?, legacy: Bool,
                               progress: ProgressTracker) throws {
         switch format {
@@ -407,6 +424,7 @@ enum AXCore {
         let tmp = spec.output.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).axtmp")
         do {
             if spec.format == .sevenZ { try writeSevenZ(items: items, to: tmp, spec: spec, progress: tracker) }
+            else if spec.format == .rar { try writeRar(items: items, to: tmp, spec: spec, progress: tracker) }
             else {
                 try write(items: items, format: spec.format, to: tmp, level: spec.level, password: spec.password,
                           legacy: spec.legacyZipCrypto, progress: tracker)
@@ -424,11 +442,57 @@ enum AXCore {
 
     // MARK: - editing (rewrite the archive without / with extra entries)
 
-    static func canEdit(_ url: URL) -> Bool { [.zip, .tar, .sevenZ].contains(kind(of: url)) }
+    private static func editRar(url: URL, tmp: URL, remove selection: [(path: String, isDir: Bool)], add items: [AXItem], roots: [URL],
+                                level: Int, password: String?, progress: ProgressTracker) throws {
+        let arc = try RarArchive(url: url, password: password)
+        let newNames = Set(items.map(\.name))
+        func matches(_ path: String) -> Bool {
+            selection.contains { $0.path == path || ($0.isDir && path.hasPrefix($0.path + "/")) } || newNames.contains(path)
+        }
+        let tempDir = tmp.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).axrebuild")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // Entries whose names fail the path check (“../…”, absolute paths) are never carried over: they were not extracted
+        // either, and falling back to the raw name would read whatever file that name points at outside the temp folder.
+        let keepEntries = arc.entries.filter { e in SafePath.clean(e.name).map { !matches($0) } ?? false }
+        let ex = try Extractor(destination: tempDir, overwrite: .all, keepPaths: true, selection: [])
+        try arc.extract(to: ex, progress: progress)
+
+        let w = try Rar5Writer(url: tmp, solid: false, password: password)
+        for e in keepEntries {
+            try Task.checkCancellation()
+            guard let clean = SafePath.clean(e.name) else { continue }
+            let localURL = tempDir.appendingPathComponent(clean)
+            let inside = tempDir.resolvingSymlinksInPath().path + "/"
+            guard localURL.resolvingSymlinksInPath().path.hasPrefix(inside) || e.isDir || e.link != nil else { continue }
+            if e.isDir {
+                try w.addDirectory(name: clean, mtime: e.mtime ?? Date(), mode: UInt32(e.attrib & 0o7777))
+            } else if let link = e.link {
+                try w.addSymlink(name: clean, target: link.target, mtime: e.mtime ?? Date(), mode: UInt32(e.attrib & 0o7777))
+            } else if FileManager.default.fileExists(atPath: localURL.path) {
+                let sz = (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? UInt64) ?? 0
+                try w.addFile(source: localURL, name: clean, size: sz, mtime: e.mtime ?? Date(), mode: UInt32(e.attrib & 0o7777), progress: progress)
+            }
+        }
+        for it in items {
+            try Task.checkCancellation()
+            switch it.kind {
+            case .dir: try w.addDirectory(name: it.name, mtime: it.mtime, mode: it.mode)
+            case .symlink:
+                let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: it.url.path)) ?? ""
+                try w.addSymlink(name: it.name, target: target, mtime: it.mtime, mode: it.mode)
+            case .file: try w.addFile(source: it.url, name: it.name, size: it.size, mtime: it.mtime, mode: it.mode, progress: progress)
+            }
+        }
+        try w.finish()
+    }
+
+    static func canEdit(_ url: URL) -> Bool { [.zip, .tar, .sevenZ, .rar].contains(kind(of: url)) }
 
     static func edit(_ url: URL, remove selection: [(path: String, isDir: Bool)], add roots: [URL], level: Int, password: String?,
                      legacy: Bool, progress: @escaping (Double) -> Void) throws {
-        guard let k = kind(of: url), k == .zip || k == .tar || k == .sevenZ else { throw AXError.unsupported("editing this format") }
+        guard let k = kind(of: url), k == .zip || k == .tar || k == .sevenZ || k == .rar else { throw AXError.unsupported("editing this format") }
         let newItems = try collect(roots)
         let newNames = Set(newItems.map(\.name))
         func matches(_ path: String) -> Bool {
@@ -436,7 +500,11 @@ enum AXCore {
         }
         let tmp = url.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).axtmp")
         do {
-            if k == .sevenZ {
+            if k == .rar {
+                let total = Int64((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? 0) + newItems.reduce(0) { $0 + Int64($1.size) }
+                let tracker = ProgressTracker(total: total, report: progress)
+                try editRar(url: url, tmp: tmp, remove: selection, add: newItems, roots: roots, level: level, password: password, progress: tracker)
+            } else if k == .sevenZ {
                 let arc = try SevenZipArchive(url: url, password: password)
                 let total = arc.files.reduce(Int64(0)) { $0 + Int64($1.size) } + newItems.reduce(0) { $0 + Int64($1.size) }
                 let tracker = ProgressTracker(total: total, report: progress)

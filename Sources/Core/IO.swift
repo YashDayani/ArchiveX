@@ -1,4 +1,5 @@
 import Foundation
+import zlib
 
 // ArchiveX Core — our own archive engine. Everything under Sources/Core is original code;
 // the only external pieces it touches are Apple system frameworks (Foundation, Compression,
@@ -51,13 +52,10 @@ enum CRC32 {
     }
 
     static func update(_ crc: UInt32, _ data: Data) -> UInt32 {
-        var c = ~crc
-        data.withUnsafeBytes { raw in
-            table.withUnsafeBufferPointer { t in
-                for b in raw.bindMemory(to: UInt8.self) { c = t[Int((c ^ UInt32(b)) & 0xff)] ^ (c >> 8) }
-            }
+        guard !data.isEmpty else { return crc }
+        return data.withUnsafeBytes { raw in
+            UInt32(zlib.crc32(uLong(crc), raw.bindMemory(to: Bytef.self).baseAddress, uInt(raw.count)))
         }
-        return ~c
     }
 }
 

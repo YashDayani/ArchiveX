@@ -24,6 +24,17 @@ Creates a tricky tree (Unicode names, a 120-character path, symlinks, permission
 round-trips it through every format both ways, plus passwords, wrong passwords, selection, overwrite policies,
 editing, zip-slip archives, corrupted and truncated files.
 
+## RAR writer tests (`RarWriteTests`)
+
+```bash
+swiftc -O -swift-version 5 Sources/Engine.swift Sources/Core/*.swift Tests/RarWriteTests/main.swift -o /tmp/RarWriteTests
+/tmp/RarWriteTests <work-dir>
+```
+
+Needs only macOS's `bsdtar`. Creates RAR 5 archives with ArchiveX's own writer (plain and encrypted), reads them back with
+ArchiveX and with libarchive, checks the password check-value layout, edits, and replays an archive whose entry is named
+`../secret.txt` to be sure the rewrite never pulls a real file into the archive.
+
 ## App tests (`AppTests`)
 
 Drives the real `ArchiveModel` (open → list → test → extract → edit) for every creatable format. Needs a work

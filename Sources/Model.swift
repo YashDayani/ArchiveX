@@ -71,8 +71,11 @@ final class ArchiveModel: ObservableObject {
     private func run<T: Sendable>(_ label: String,
                                   _ work: @escaping @Sendable (@escaping @Sendable (Double) -> Void) throws -> T) async -> Result<T, Error> {
         busy = true; busyLabel = label; progress = nil
-        let task = Task.detached(priority: .userInitiated) { [weak self] () throws -> T in
-            try work { p in Task { @MainActor in self?.progress = p } }
+        let onProgress: @Sendable (Double) -> Void = { [weak self] p in
+            Task { @MainActor [weak self] in self?.progress = p }
+        }
+        let task = Task.detached(priority: .userInitiated) { () throws -> T in
+            try work(onProgress)
         }
         cancelWork = { task.cancel() }
         let result = await task.result
@@ -127,18 +130,19 @@ final class ArchiveModel: ObservableObject {
             return
         }
         let pw = password
-        Task {
-            switch await run("Opening archive…", { _ in try AXCore.list(url, password: pw) }) {
+        Task { [weak self] in
+            guard let self else { return }
+            switch await self.run("Opening archive…", { _ in try AXCore.list(url, password: pw) }) {
             case .success(let l):
-                if archiveURL != url { selection = [] }
-                archiveURL = url
-                entries = l.entries; details = l.details
-                packedPerFileUnknown = l.solid
-                packedTotal = l.totalPacked
-                currentDir = ""
+                if self.archiveURL != url { self.selection = [] }
+                self.archiveURL = url
+                self.entries = l.entries; self.details = l.details
+                self.packedPerFileUnknown = l.solid
+                self.packedTotal = l.totalPacked
+                self.currentDir = ""
                 NSDocumentController.shared.noteNewRecentDocumentURL(url)
             case .failure(let e):
-                handle(e, title: "Can’t open archive") { [weak self] in self?.open(url) }
+                self.handle(e, title: "Can’t open archive") { [weak self] in self?.open(url) }
             }
         }
     }
@@ -201,18 +205,19 @@ final class ArchiveModel: ObservableObject {
         UserDefaults.standard.set(dest.deletingLastPathComponent().path, forKey: "lastExtractDir")
         let sel = d.onlySelected ? selectionPairs : []
         let pw = password
-        Task {
-            switch await run("Extracting…", { p in
+        Task { [weak self] in
+            guard let self else { return }
+            switch await self.run("Extracting…", { p in
                 try AXCore.extract(url, selection: sel, to: dest, overwrite: d.overwrite.core, keepPaths: d.keepPaths, password: pw, progress: p)
             }) {
             case .success(let skipped):
                 if !skipped.isEmpty {
-                    alert = AlertInfo(title: "Some entries were skipped",
-                                      message: "\(skipped.count) entr\(skipped.count == 1 ? "y" : "ies") had unsafe paths (for example “../”) and were not extracted:\n" + skipped.prefix(5).joined(separator: "\n"))
+                    self.alert = AlertInfo(title: "Some entries were skipped",
+                                           message: "\(skipped.count) entr\(skipped.count == 1 ? "y" : "ies") had unsafe paths (for example “../”) and were not extracted:\n" + skipped.prefix(5).joined(separator: "\n"))
                 }
                 if d.openAfter { NSWorkspace.shared.activateFileViewerSelecting([dest]) }
             case .failure(let e):
-                handle(e, title: "Extraction failed") { [weak self] in self?.extract(d) }
+                self.handle(e, title: "Extraction failed") { [weak self] in self?.extract(d) }
             }
         }
     }
@@ -221,12 +226,13 @@ final class ArchiveModel: ObservableObject {
         guard let url = archiveURL, !row.isDir else { return }
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("ArchiveX-\(UUID().uuidString)")
         let pw = password
-        Task {
-            switch await run("Extracting \(row.name)…", { p in
+        Task { [weak self] in
+            guard let self else { return }
+            switch await self.run("Extracting \(row.name)…", { p in
                 try AXCore.extract(url, selection: [(path: row.id, isDir: false)], to: tmp, overwrite: .all, keepPaths: true, password: pw, progress: p)
             }) {
             case .success: NSWorkspace.shared.open(tmp.appendingPathComponent(row.id))
-            case .failure(let e): handle(e, title: "Can’t open file") { [weak self] in self?.view(row) }
+            case .failure(let e): self.handle(e, title: "Can’t open file") { [weak self] in self?.view(row) }
             }
         }
     }
@@ -236,11 +242,12 @@ final class ArchiveModel: ObservableObject {
     func test() {
         guard let url = archiveURL else { return }
         let pw = password
-        Task {
-            switch await run("Testing archive…", { p in try AXCore.test(url, password: pw, progress: p) }) {
+        Task { [weak self] in
+            guard let self else { return }
+            switch await self.run("Testing archive…", { p in try AXCore.test(url, password: pw, progress: p) }) {
             case .success:
-                alert = AlertInfo(title: "No errors found", message: "All \(fileCount) files in “\(url.lastPathComponent)” passed the integrity test.")
-            case .failure(let e): handle(e, title: "Errors found") { [weak self] in self?.test() }
+                self.alert = AlertInfo(title: "No errors found", message: "All \(self.fileCount) files in “\(url.lastPathComponent)” passed the integrity test.")
+            case .failure(let e): self.handle(e, title: "Errors found") { [weak self] in self?.test() }
             }
         }
     }
@@ -250,7 +257,7 @@ final class ArchiveModel: ObservableObject {
         guard let url = archiveURL, !rows.isEmpty else { return }
         guard AXCore.canEdit(url) else {
             alert = AlertInfo(title: "Archive is read-only",
-                              message: "ArchiveX can remove files from ZIP, 7z and TAR archives. This format can only be opened and extracted.")
+                              message: "ArchiveX can remove files from ZIP, 7z, RAR and TAR archives. This format can only be opened and extracted.")
             return
         }
         alert = AlertInfo(title: "Delete \(rows.count) item\(rows.count == 1 ? "" : "s") from the archive?",
@@ -278,7 +285,7 @@ final class ArchiveModel: ObservableObject {
         if toOpenArchive, let existing = archiveURL {
             guard let f = ArchiveFormat.forExisting(existing), f.canUpdate else {
                 alert = AlertInfo(title: "Can’t add to this archive",
-                                  message: "ArchiveX can add files to ZIP, 7z and TAR archives. Other formats can only be opened and extracted.")
+                                  message: "ArchiveX can add files to ZIP, 7z, RAR and TAR archives. Other formats can only be opened and extracted.")
                 return
             }
             format = f
@@ -312,13 +319,13 @@ final class ArchiveModel: ObservableObject {
         let target = URL(fileURLWithPath: archive)
         let openAfter = archiveURL?.path == archive
         let exists = FileManager.default.fileExists(atPath: archive)
-        let wanted: AXKind? = d.format == .zip ? .zip : d.format == .tar ? .tar : d.format == .sevenZ ? .sevenZ : nil
+        let wanted: AXKind? = d.format == .zip ? .zip : d.format == .tar ? .tar : d.format == .sevenZ ? .sevenZ : d.format == .rar ? .rar : nil
         let edit = exists && AXCore.canEdit(target) && AXCore.kind(of: target) == wanted
         if exists && !edit && d.format.isTarCompressed {
             alert = AlertInfo(title: "File already exists", message: "“\(target.lastPathComponent)” already exists and compressed TAR archives can’t be added to. Choose another name.")
             return
         }
-        let level = d.format == .sevenZ ? d.level : (d.level == 0 ? 0 : 6)
+        let level = (d.format == .sevenZ || d.format == .rar) ? d.level : (d.level == 0 ? 0 : 6)
         let pw: String? = d.password.isEmpty || !d.format.password ? nil : d.password
         let files = d.files
         Task {

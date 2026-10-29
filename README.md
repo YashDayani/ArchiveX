@@ -41,8 +41,8 @@
 |---|:---:|:---:|:---:|
 | **ZIP** — Deflate, Deflate64, bzip2, LZMA, store, ZIP64, AES-256, ZipCrypto, UTF-8 names, split sets (`.zip.001`, Info-ZIP `.z01`) | ✅ | ✅ | ✅ |
 | **7z** — LZMA2, LZMA, PPMd, BZip2, Deflate, store, BCJ / BCJ2 / ARM / ARM Thumb / ARM64 / PowerPC / SPARC / Itanium / Delta filters, split sets (`.7z.001`), AES-256, encrypted file names, solid | ✅ | ✅ | ✅ |
-| **RAR 5** — all methods, solid, filters, AES-256, encrypted headers, multi-volume sets | ✅ | ❌ ¹ | ❌ |
-| **RAR 3 / RAR 4** — LZ and PPMd text compression, all six filters, AES-128, encrypted file names, solid, multi-volume sets (`.part01.rar`, `.rar`/`.r00`) | ✅ | ❌ ¹ | ❌ |
+| **RAR 5** — all methods, solid, filters, AES-256, encrypted headers, multi-volume sets | ✅ | ✅ ¹ | ✅ ¹ |
+| **RAR 3 / RAR 4** — LZ and PPMd text compression, all six filters, AES-128, encrypted file names, solid, multi-volume sets (`.part01.rar`, `.rar`/`.r00`) | ✅ | — | — |
 | **TAR** (ustar, pax, GNU) | ✅ | ✅ | ✅ |
 | **TAR.GZ · TAR.BZ2 · TAR.XZ** | ✅ | ✅ | — |
 | **Zstandard** (`.zst`, `.tar.zst`, zstd RPMs) | ✅ | — | — |
@@ -54,7 +54,7 @@
 | **DEB · AR · RPM** (gzip / bzip2 / xz payloads) | ✅ | — | — |
 | **CAB** (stored, MSZIP) · **.Z** (compress) · **.lzma** | ✅ | — | — |
 
-¹ RARLAB's license reserves the RAR compression algorithm, so ArchiveX can read RAR but will never create it.
+¹ RAR 5 creation and in-place editing are implemented in native Swift in `Sources/Core` and write standard RAR 5.0 archives with AES-256 password protection. They **store** files without compressing them (ArchiveX does not re-create RARLAB's compression algorithm), so use 7z when size matters. Editing converts the result to a plain RAR 5 archive.
 
 **Not supported (yet):** RAR 1.x / 2.x (pre-2000 archives), encrypted APFS volumes, APFS snapshots, files compressed with
 the old zlib resource-fork layout, CAB files using LZX or Quantum, Zstandard data that needs a dictionary, WIM, ARJ, LZH,
@@ -145,7 +145,7 @@ SwiftUI window  →  ArchiveModel  →  ArchiveX Core (Sources/Core)
   signed and notarized automatically as soon as an Apple Developer ID is configured for the release workflow.
 - Compression ratios are close to, but not always identical to, those of 7-Zip. BZ2 compression is slow on highly
   repetitive data.
-- Editing a 7z archive rewrites it. TAR.GZ / TAR.BZ2 / TAR.XZ and RAR archives are read-only after creation.
+- Editing a 7z or RAR archive rewrites it. TAR.GZ / TAR.BZ2 / TAR.XZ archives are read-only after creation.
 
 ## License
 

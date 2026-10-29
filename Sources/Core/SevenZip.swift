@@ -470,7 +470,7 @@ final class SevenZipArchive {
     private func readFiles(_ r: inout HReader) throws {
         let n = Int(try r.number())
         var list = [SZFile](repeating: SZFile(), count: n)
-        var emptyStream = [Bool](repeating: false, count: n), emptyFile: [Bool] = [], anti: [Bool] = []
+        var emptyStream = [Bool](repeating: false, count: n), emptyFile: [Bool] = []
         while true {
             let t = Int(try r.number())
             if t == ID.end { break }
@@ -480,7 +480,7 @@ final class SevenZipArchive {
             switch t {
             case ID.emptyStream: emptyStream = try b.bitVector(n)
             case ID.emptyFile: emptyFile = try b.bitVector(emptyStream.filter { $0 }.count)
-            case ID.anti: anti = try b.bitVector(emptyStream.filter { $0 }.count)
+            case ID.anti: _ = try b.bitVector(emptyStream.filter { $0 }.count)
             case ID.names:
                 guard try b.byte() == 0 else { throw AXError.unsupported("external 7z names") }
                 let raw = b.d.subdata(in: b.d.startIndex + b.p..<b.d.endIndex)
