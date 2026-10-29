@@ -181,6 +181,28 @@ do {
     check("split archive creation tests", false, "\(error)")
 }
 
+// Re-creating a split set under the same name must not leave parts of the older, larger set behind.
+do {
+    let dir = work.appendingPathComponent("stale_parts"); try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    let out = dir.appendingPathComponent("set.zip")
+    func make(_ size: Int) throws {
+        let f = dir.appendingPathComponent("src\(size).bin")
+        try Data((0..<size).map { _ in UInt8.random(in: 0...255) }).write(to: f)
+        var spec = AXCreate(format: .zip, output: out, items: [f], level: 0, password: nil, legacyZipCrypto: false, deleteAfter: false)
+        spec.splitVolumeSize = 16_384
+        try AXCore.create(spec, progress: { _ in })
+    }
+    func parts() -> Int { ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasPrefix("set.zip.") }.count }
+    try make(200_000)
+    let big = parts()
+    try make(3_000)
+    check("re-creating a split set removes the older, extra parts", big > 2 && parts() == 1, "\(big) -> \(parts())")
+    try AXCore.test(dir.appendingPathComponent("set.zip.001"), password: nil, progress: { _ in })
+    check("the re-created split set tests clean", true)
+} catch {
+    check("stale split parts", false, "\(error)")
+}
+
 print("\nRESULT: \(pass) passed, \(fail) failed")
 exit(fail == 0 ? 0 : 1)
 

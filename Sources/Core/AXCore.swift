@@ -426,13 +426,22 @@ enum AXCore {
                 baseName = String(baseName[..<dot])
             }
             let dir = final.deletingLastPathComponent()
+            // A set from an earlier run under the same name would otherwise be joined to the new one (.004, .005 … left over).
+            for old in (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [] {
+                guard old.hasPrefix(baseName + "."), old.count == baseName.count + 4,
+                      old.suffix(3).allSatisfy({ $0.isASCII && $0.isNumber }) else { continue }
+                try? FileManager.default.removeItem(at: dir.appendingPathComponent(old))
+            }
             let file = try FileIn(tmp)
             let total = file.size
             var offset: UInt64 = 0
             var partIndex = 1
             let firstURL = dir.appendingPathComponent(baseName + ".001")
+            var made: [URL] = []
+            do {
             while offset < total || (total == 0 && partIndex == 1) {
                 let partURL = dir.appendingPathComponent(baseName + "." + String(format: "%03d", partIndex))
+                made.append(partURL)
                 let partOut = try FileOut(partURL)
                 let toWrite = min(volSize, total - offset)
                 var written: UInt64 = 0
@@ -445,6 +454,10 @@ enum AXCore {
                 offset += toWrite
                 partIndex += 1
                 if total == 0 { break }
+            }
+            } catch {
+                for u in made { try? FileManager.default.removeItem(at: u) }       // never leave half a set behind
+                throw error
             }
             try? FileManager.default.removeItem(at: tmp)
             return firstURL

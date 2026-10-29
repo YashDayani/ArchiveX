@@ -268,6 +268,18 @@ enum SafePath {
 }
 
 /// Writes archive members under a destination folder with overwrite policy and zip-slip protection.
+/// Shared stop state for `DispatchQueue.concurrentPerform` loops: the first error wins, and every worker reads it under the lock.
+final class ParallelRun {
+    private let lock = NSLock()
+    private var firstError: Error?
+    private var cancelled = false
+    var shouldStop: Bool { lock.lock(); defer { lock.unlock() }; return cancelled || firstError != nil }
+    func fail(_ e: Error) { lock.lock(); if firstError == nil { firstError = e }; lock.unlock() }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    /// Call after the loop has finished.
+    func finish() throws { if let e = firstError { throw e }; if cancelled { throw CancellationError() } }
+}
+
 final class Extractor {
     enum Overwrite { case all, skip, rename }
 

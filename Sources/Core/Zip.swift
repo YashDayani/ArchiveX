@@ -329,16 +329,10 @@ final class ZipArchive {
                 extractor.finalize(url, mode: e.unixMode, mtime: e.mtime)
             }
         } else {
-            var firstError: Error?
-            let errLock = NSLock()
-            var cancelled = false
-
+            let run = ParallelRun()
             DispatchQueue.concurrentPerform(iterations: files.count) { i in
-                if cancelled || firstError != nil { return }
-                if Task.isCancelled {
-                    cancelled = true
-                    return
-                }
+                if run.shouldStop { return }
+                if Task.isCancelled { run.cancel(); return }
                 let e = files[i]
                 do {
                     guard let url = try extractor.destination(for: e.name, isDir: false) else {
@@ -354,13 +348,10 @@ final class ZipArchive {
                     }
                     extractor.finalize(url, mode: e.unixMode, mtime: e.mtime)
                 } catch {
-                    errLock.lock()
-                    if firstError == nil { firstError = error }
-                    errLock.unlock()
+                    run.fail(error)
                 }
             }
-            if let error = firstError { throw error }
-            if cancelled { throw CancellationError() }
+            try run.finish()
         }
 
         // Symlinks (sequential)
@@ -388,23 +379,18 @@ final class ZipArchive {
                 try read(e, password: password, progress: progress, into: NullSink())
             }
         } else {
-            var firstError: Error?
-            let errLock = NSLock()
-            var cancelled = false
+            let run = ParallelRun()
             DispatchQueue.concurrentPerform(iterations: testEntries.count) { i in
-                if cancelled || firstError != nil { return }
-                if Task.isCancelled { cancelled = true; return }
+                if run.shouldStop { return }
+                if Task.isCancelled { run.cancel(); return }
                 let e = testEntries[i]
                 do {
                     try self.read(e, password: password, progress: progress, into: NullSink())
                 } catch {
-                    errLock.lock()
-                    if firstError == nil { firstError = error }
-                    errLock.unlock()
+                    run.fail(error)
                 }
             }
-            if let error = firstError { throw error }
-            if cancelled { throw CancellationError() }
+            try run.finish()
         }
     }
 }
