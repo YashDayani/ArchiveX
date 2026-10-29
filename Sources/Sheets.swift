@@ -490,8 +490,16 @@ struct UpdateSheet: View {
 
     private func buttons<C: View>(@ViewBuilder _ content: () -> C) -> some View { HStack { content() }.padding(.top, 4) }
 
+    /// Release notes are GitHub Markdown; headings become bold lines and list markers become bullets, the rest keeps its inline styling.
     private static func notes(_ markdown: String) -> AttributedString {
-        let text = markdown.isEmpty ? "No release notes." : markdown
-        return (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(text)
+        let lines = markdown.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n").map { line -> String in
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("#") { return "**" + t.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces) + "**" }
+            if t.hasPrefix("- ") || t.hasPrefix("* ") { return "•  " + t.dropFirst(2) }
+            return line
+        }
+        let text = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let source = text.isEmpty ? "No release notes." : text
+        return (try? AttributedString(markdown: source, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(source)
     }
 }
