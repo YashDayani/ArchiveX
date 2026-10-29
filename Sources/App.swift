@@ -29,6 +29,13 @@ struct MenuCommands: Commands {
                 .keyboardShortcut("w").disabled(!model.hasArchive)
         }
         CommandMenu("Commands") {
+            Button("Quick Look (Space)") { model.quickLookSelected() }
+                .disabled(model.selection.isEmpty)
+            Button("View") {
+                if let r = model.selectedRows.first(where: { !$0.isDir }) { model.view(r) }
+            }
+            .keyboardShortcut("v", modifiers: [.command, .shift]).disabled(model.selectedRows.allSatisfy(\.isDir))
+            Divider()
             Button("Add Files to Archive…") { Panels.addToOpen(model) }
                 .keyboardShortcut("a", modifiers: [.command, .shift]).disabled(!model.hasArchive)
             Button("Extract To…") { model.prepareExtract() }
@@ -40,56 +47,8 @@ struct MenuCommands: Commands {
             Divider()
             Button("Test Archive") { model.test() }
                 .keyboardShortcut("t").disabled(!model.hasArchive)
-            Button("Delete Selected from Archive") { model.confirmDelete() }
-                .keyboardShortcut(.delete).disabled(model.selection.isEmpty)
+            Button("Delete Selected from Archive (Delete)") { model.confirmDelete() }
+                .disabled(model.selection.isEmpty)
         }
-    }
-}
-
-enum Panels {
-    @MainActor static func openArchive(_ model: ArchiveModel) {
-        let p = NSOpenPanel()
-        p.allowsMultipleSelection = false
-        p.canChooseDirectories = false
-        p.message = "Choose an archive (RAR, 7z, ZIP, TAR, ISO, …)"
-        if p.runModal() == .OK, let u = p.url { model.open(u) }
-    }
-
-    @MainActor static func newArchive(_ model: ArchiveModel) {
-        let p = NSOpenPanel()
-        p.allowsMultipleSelection = true
-        p.canChooseDirectories = true
-        p.canChooseFiles = true
-        p.prompt = "Add"
-        p.message = "Choose files and folders to compress"
-        if p.runModal() == .OK, !p.urls.isEmpty { model.prepareAdd(files: p.urls) }
-    }
-
-    @MainActor static func addToOpen(_ model: ArchiveModel) {
-        let p = NSOpenPanel()
-        p.allowsMultipleSelection = true
-        p.canChooseDirectories = true
-        p.prompt = "Add"
-        p.message = "Choose files to add to “\(model.title)”"
-        if p.runModal() == .OK, !p.urls.isEmpty { model.prepareAdd(files: p.urls, toOpenArchive: true) }
-    }
-
-    @MainActor static func chooseFolder(start: String) -> String? {
-        let p = NSOpenPanel()
-        p.canChooseFiles = false
-        p.canChooseDirectories = true
-        p.canCreateDirectories = true
-        p.prompt = "Select"
-        p.directoryURL = URL(fileURLWithPath: start).deletingLastPathComponent()
-        return p.runModal() == .OK ? p.url?.path : nil
-    }
-
-    @MainActor static func chooseSaveLocation(current: String) -> String? {
-        let p = NSSavePanel()
-        p.nameFieldStringValue = (current as NSString).lastPathComponent
-        p.allowsOtherFileTypes = true
-        p.directoryURL = URL(fileURLWithPath: current).deletingLastPathComponent()
-        p.canCreateDirectories = true
-        return p.runModal() == .OK ? p.url?.path : nil
     }
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import QuickLook
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -32,6 +33,11 @@ struct ContentView: View {
         .navigationTitle(model.title)
         .overlay { if model.busy { BusyOverlay() } }
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted, perform: handleDrop)
+        .quickLookPreview($model.quickLookURL)
+        .onAppear {
+            ArchiveModel.cleanOldScratch()
+            KeyEvents.install(model)
+        }
         .alert(item: $model.alert) { info in
             if let title = info.actionTitle, let action = info.action {
                 return Alert(title: Text(info.title), message: Text(info.message),
@@ -80,6 +86,9 @@ struct ButtonBar: View {
             BarButton("Add", "plus.rectangle.on.folder", enabled: model.hasArchive) { Panels.addToOpen(model) }
             BarButton("Extract To", "arrow.down.doc", enabled: model.hasArchive) { model.prepareExtract() }
             BarButton("Test", "checkmark.shield", enabled: model.hasArchive) { model.test() }
+            BarButton("Quick Look", "eye.circle", enabled: model.selectedRows.contains { !$0.isDir }) {
+                model.quickLookSelected()
+            }
             BarButton("View", "eye", enabled: model.selectedRows.contains { !$0.isDir }) {
                 if let r = model.selectedRows.first(where: { !$0.isDir }) { model.view(r) }
             }
@@ -124,16 +133,44 @@ struct PathBar: View {
     var body: some View {
         HStack(spacing: 8) {
             Button { model.goUp() } label: { Image(systemName: "arrow.turn.left.up") }
-                .disabled(model.currentDir.isEmpty).help("Up one level")
+                .disabled(model.currentDir.isEmpty || !model.searchQuery.isEmpty).help("Up one level")
             Image(systemName: "doc.zipper").foregroundStyle(.secondary)
             Text(model.archiveURL?.lastPathComponent ?? "")
                 .fontWeight(.medium)
-            if !model.currentDir.isEmpty {
+            if !model.currentDir.isEmpty && model.searchQuery.isEmpty {
                 Text("›").foregroundStyle(.secondary)
                 Text(model.currentDir.replacingOccurrences(of: "/", with: "  ›  "))
             }
+            if !model.searchQuery.isEmpty {
+                Text("›").foregroundStyle(.secondary)
+                Text("Search: “\(model.searchQuery)” (\(model.visibleRows.count) found)")
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
-            if !model.details.isEmpty {
+
+            // Search bar
+            HStack(spacing: 4) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                TextField("Search archive…", text: $model.searchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .frame(width: 120)
+                if !model.searchQuery.isEmpty {
+                    Button { model.searchQuery = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+
+            if !model.details.isEmpty && model.searchQuery.isEmpty {
                 Text(model.details).font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -161,6 +198,8 @@ struct FileTable: View {
                     Text(r.name).lineLimit(1)
                     if r.encrypted { Image(systemName: "lock.fill").font(.caption2).foregroundStyle(.secondary) }
                 }
+                .contentShape(Rectangle())
+                .onDrag { model.fileProvider(for: r) }
             }.width(min: 180, ideal: 300)
             TableColumn("Size", value: \.size) { Text($0.sizeText).monospacedDigit() }
                 .width(min: 70, ideal: 90)
@@ -175,12 +214,17 @@ struct FileTable: View {
             TableColumn("CRC32", value: \.crc) { Text($0.crc).font(.system(.body, design: .monospaced)) }
                 .width(min: 70, ideal: 90)
         }
+        // The standard Copy command (⌘C) copies the selected items while the table has focus; in a text field it still copies text.
+        .onCopyCommand { model.copySelection(); return [] }
         .contextMenu(forSelectionType: String.self) { ids in
             if !ids.isEmpty {
-                Button("Extract Selected To…") { model.prepareExtract() }
                 if let r = model.visibleRows.first(where: { ids.contains($0.id) }), !r.isDir {
+                    Button("Quick Look (Space)") { model.quickLookSelected() }
                     Button("View") { model.view(r) }
+                    Divider()
                 }
+                Button("Copy (⌘C)") { model.copySelection() }
+                Button("Extract Selected To…") { model.prepareExtract() }
                 Divider()
                 Button("Delete from Archive", role: .destructive) { model.confirmDelete() }
             }
@@ -315,6 +359,80 @@ struct BusyOverlay: View {
             .padding(24)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             .shadow(radius: 12)
+        }
+    }
+}
+
+enum Panels {
+    @MainActor static func openArchive(_ model: ArchiveModel) {
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = false
+        p.canChooseDirectories = false
+        p.message = "Choose an archive (RAR, 7z, ZIP, TAR, ISO, …)"
+        if p.runModal() == .OK, let u = p.url { model.open(u) }
+    }
+
+    @MainActor static func newArchive(_ model: ArchiveModel) {
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = true
+        p.canChooseDirectories = true
+        p.canChooseFiles = true
+        p.prompt = "Add"
+        p.message = "Choose files and folders to compress"
+        if p.runModal() == .OK, !p.urls.isEmpty { model.prepareAdd(files: p.urls) }
+    }
+
+    @MainActor static func addToOpen(_ model: ArchiveModel) {
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = true
+        p.canChooseDirectories = true
+        p.prompt = "Add"
+        p.message = "Choose files to add to “\(model.title)”"
+        if p.runModal() == .OK, !p.urls.isEmpty { model.prepareAdd(files: p.urls, toOpenArchive: true) }
+    }
+
+    @MainActor static func chooseFolder(start: String) -> String? {
+        let p = NSOpenPanel()
+        p.canChooseFiles = false
+        p.canChooseDirectories = true
+        p.canCreateDirectories = true
+        p.prompt = "Select"
+        p.directoryURL = URL(fileURLWithPath: start).deletingLastPathComponent()
+        return p.runModal() == .OK ? p.url?.path : nil
+    }
+
+    @MainActor static func chooseSaveLocation(current: String) -> String? {
+        let p = NSSavePanel()
+        p.nameFieldStringValue = (current as NSString).lastPathComponent
+        p.allowsOtherFileTypes = true
+        p.directoryURL = URL(fileURLWithPath: current).deletingLastPathComponent()
+        p.canCreateDirectories = true
+        return p.runModal() == .OK ? p.url?.path : nil
+    }
+}
+
+
+// MARK: - Space and Delete
+
+/// Space (Quick Look) and Delete work on the file table, but must never steal the key from a text field (the search box,
+/// the password and path fields in sheets) or from a sheet, alert or the Quick Look panel itself. Menu shortcuts without a
+/// modifier cannot make that distinction, so these two keys are handled here, only when no text is being edited.
+@MainActor
+enum KeyEvents {
+    private static var monitor: Any?
+
+    static func install(_ model: ArchiveModel) {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+                  let w = NSApp.keyWindow, !(w is NSPanel), w.attachedSheet == nil,
+                  !(w.firstResponder is NSTextView), !(w.firstResponder is NSTextField),
+                  model.hasArchive, !model.selection.isEmpty else { return event }
+            switch event.keyCode {
+            case 49: model.quickLookSelected(); return nil                     // space
+            case 51, 117: model.confirmDelete(); return nil                    // delete, forward delete
+            default: return event
+            }
         }
     }
 }

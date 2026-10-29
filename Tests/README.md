@@ -35,6 +35,16 @@ Needs only macOS's `bsdtar`. Creates RAR 5 archives with ArchiveX's own writer (
 ArchiveX and with libarchive, checks the password check-value layout, edits, and replays an archive whose entry is named
 `../secret.txt` to be sure the rewrite never pulls a real file into the archive.
 
+## Window model tests (`ModelTests`)
+
+```bash
+swiftc -O -swift-version 5 $(ls Sources/*.swift | grep -v App.swift) Sources/Core/*.swift Tests/ModelTests/main.swift -o /tmp/ModelTests
+/tmp/ModelTests <work-dir>
+```
+
+Headless checks of the window model: Quick Look previews never leak between archives, drag-out hands over a lazy file that is only extracted
+when the receiver asks for it, and the search filter. Needs only `/usr/bin/zip`.
+
 ## App tests (`AppTests`)
 
 Drives the real `ArchiveModel` (open → list → test → extract → edit) for every creatable format. Needs a work
