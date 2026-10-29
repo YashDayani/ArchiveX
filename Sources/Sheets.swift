@@ -23,9 +23,10 @@ struct AddSheet: View {
             TabView {
                 general.tabItem { Text("General") }
                 security.tabItem { Text("Password") }
+                commentTab.tabItem { Text("Comment") }
             }
             .padding(.horizontal, 12)
-            .frame(height: 300)
+            .frame(height: 350)
             // macOS draws the tab labels squeezed ("G…", "P…") on the first layout pass and fixes them on the next one,
             // so build the tab view a second time right after the sheet has appeared.
             .id(tabsPass)
@@ -70,6 +71,22 @@ struct AddSheet: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             if draft.format.solid { Toggle("Create solid archive (smaller, slower to edit)", isOn: $draft.solid) }
+            if !draft.updatingExisting {
+                Picker("Split volumes", selection: $draft.splitPreset) {
+                    ForEach(SplitPreset.allCases) { Text($0.rawValue).tag($0) }
+                }
+                if draft.splitPreset == .custom {
+                    HStack {
+                        TextField("Volume size", value: $draft.customSplitMB, format: .number)
+                            .frame(width: 80)
+                        Text("MB").foregroundStyle(.secondary)
+                    }
+                }
+                if draft.splitPreset != .none {
+                    Text("Splits output into .001, .002, … volume parts.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
             Toggle("Test archived files", isOn: $draft.test)
             Toggle("Delete files after archiving", isOn: $draft.deleteAfter)
             Text("\(draft.files.count) item\(draft.files.count == 1 ? "" : "s") to add: \(draft.files.prefix(3).map(\.lastPathComponent).joined(separator: ", "))\(draft.files.count > 3 ? "…" : "")")
@@ -104,6 +121,22 @@ struct AddSheet: View {
                 Text("\(draft.format.rawValue) archives cannot be password protected. Choose 7z, RAR or ZIP for encryption.")
                     .foregroundStyle(.secondary)
             }
+        }
+        .padding(16)
+    }
+
+    private var commentTab: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Archive Comment (ZIP)")
+                .font(.headline)
+            Text("Optional comment embedded in the ZIP central directory header.")
+                .font(.caption).foregroundStyle(.secondary)
+            TextEditor(text: $draft.comment)
+                .font(.system(.body, design: .monospaced))
+                .padding(4)
+                .background(Color(NSColor.textBackgroundColor))
+                .cornerRadius(6)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(NSColor.separatorColor), lineWidth: 1))
         }
         .padding(16)
     }
@@ -244,6 +277,23 @@ struct InfoSheet: View {
                 }
             }
             .font(.callout)
+
+            if let comment = info.comment, !comment.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Archive Comment:").font(.callout.weight(.medium)).foregroundStyle(.secondary)
+                    ScrollView {
+                        Text(comment)
+                            .font(.system(.caption, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 100)
+                    .background(Color(NSColor.textBackgroundColor))
+                    .cornerRadius(6)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(NSColor.separatorColor), lineWidth: 1))
+                }
+            }
 
             Divider()
 

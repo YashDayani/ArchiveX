@@ -170,6 +170,10 @@ final class ZipArchive {
     var listing: Listing {
         var l = Listing()
         l.details = "ZIP" + (entries.contains { $0.aesStrength != nil } ? " · AES-256" : entries.contains { $0.encrypted } ? " · ZipCrypto" : "")
+        if !comment.isEmpty {
+            let commText = String(data: comment, encoding: .utf8) ?? String(data: comment, encoding: .isoLatin1)
+            l.comment = (commText?.isEmpty ?? true) ? nil : commText
+        }
         l.entries = entries.map { e in
             let clean = SafePath.clean(e.name) ?? e.name
             return ArchiveEntry(path: clean, isDir: e.isDir, size: Int64(e.usize), packed: Int64(e.csize),
@@ -289,35 +293,118 @@ final class ZipArchive {
 
     func extract(selection: [(path: String, isDir: Bool)], to extractor: Extractor, password: String?,
                  progress: ProgressTracker?) throws {
+        var dirs: [(ZipEntry, URL)] = []
+        var files: [ZipEntry] = []
+        var links: [ZipEntry] = []
+
         for e in entries {
             try Task.checkCancellation()
-            guard let clean = SafePath.clean(e.name) else { if !e.name.isEmpty { _ = try extractor.destination(for: e.name, isDir: e.isDir) }; continue }
+            guard let clean = SafePath.clean(e.name) else {
+                if !e.name.isEmpty { _ = try extractor.destination(for: e.name, isDir: e.isDir) }
+                continue
+            }
             guard extractor.isSelected(clean) else { continue }
             if e.isDir {
                 if extractor.keepPaths, let url = try extractor.destination(for: e.name, isDir: true) {
                     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-                    extractor.finalize(url, mode: e.unixMode, mtime: e.mtime)
+                    dirs.append((e, url))
                 }
-                continue
+            } else if e.isSymlink {
+                links.append(e)
+            } else {
+                files.append(e)
             }
-            if e.isSymlink {
-                let sink = MemorySink()
-                try read(e, password: password, progress: nil, into: sink)
-                if let url = try extractor.destination(for: e.name, isDir: false),
-                   let target = String(data: sink.data, encoding: .utf8) { extractor.makeSymlink(at: url, target: target) }
-                continue
+        }
+
+        // Parallel extraction of regular files
+        if files.count <= 1 {
+            for e in files {
+                try Task.checkCancellation()
+                guard let url = try extractor.destination(for: e.name, isDir: false) else {
+                    try progress?.add(Int(e.usize)); continue
+                }
+                let out = try FileOut(url)
+                do { try read(e, password: password, progress: progress, into: out) }
+                catch { try? FileManager.default.removeItem(at: url); throw error }
+                extractor.finalize(url, mode: e.unixMode, mtime: e.mtime)
             }
-            guard let url = try extractor.destination(for: e.name, isDir: false) else { try progress?.add(Int(e.usize)); continue }
-            let out = try FileOut(url)
-            do { try read(e, password: password, progress: progress, into: out) }
-            catch { try? FileManager.default.removeItem(at: url); throw error }
+        } else {
+            var firstError: Error?
+            let errLock = NSLock()
+            var cancelled = false
+
+            DispatchQueue.concurrentPerform(iterations: files.count) { i in
+                if cancelled || firstError != nil { return }
+                if Task.isCancelled {
+                    cancelled = true
+                    return
+                }
+                let e = files[i]
+                do {
+                    guard let url = try extractor.destination(for: e.name, isDir: false) else {
+                        try progress?.add(Int(e.usize))
+                        return
+                    }
+                    let out = try FileOut(url)
+                    do {
+                        try self.read(e, password: password, progress: progress, into: out)
+                    } catch {
+                        try? FileManager.default.removeItem(at: url)
+                        throw error
+                    }
+                    extractor.finalize(url, mode: e.unixMode, mtime: e.mtime)
+                } catch {
+                    errLock.lock()
+                    if firstError == nil { firstError = error }
+                    errLock.unlock()
+                }
+            }
+            if let error = firstError { throw error }
+            if cancelled { throw CancellationError() }
+        }
+
+        // Symlinks (sequential)
+        for e in links {
+            try Task.checkCancellation()
+            let sink = MemorySink()
+            try read(e, password: password, progress: nil, into: sink)
+            if let url = try extractor.destination(for: e.name, isDir: false),
+               let target = String(data: sink.data, encoding: .utf8) {
+                extractor.makeSymlink(at: url, target: target)
+            }
+        }
+
+        // Apply directory attributes in reverse depth order
+        dirs.sort { $0.1.path.count > $1.1.path.count }
+        for (e, url) in dirs {
             extractor.finalize(url, mode: e.unixMode, mtime: e.mtime)
         }
     }
 
     func test(password: String?, progress: ProgressTracker?) throws {
-        for e in entries where !e.isDir {
-            try read(e, password: password, progress: progress, into: NullSink())
+        let testEntries = entries.filter { !$0.isDir }
+        if testEntries.count <= 1 {
+            for e in testEntries {
+                try read(e, password: password, progress: progress, into: NullSink())
+            }
+        } else {
+            var firstError: Error?
+            let errLock = NSLock()
+            var cancelled = false
+            DispatchQueue.concurrentPerform(iterations: testEntries.count) { i in
+                if cancelled || firstError != nil { return }
+                if Task.isCancelled { cancelled = true; return }
+                let e = testEntries[i]
+                do {
+                    try self.read(e, password: password, progress: progress, into: NullSink())
+                } catch {
+                    errLock.lock()
+                    if firstError == nil { firstError = error }
+                    errLock.unlock()
+                }
+            }
+            if let error = firstError { throw error }
+            if cancelled { throw CancellationError() }
         }
     }
 }
@@ -368,12 +455,14 @@ final class ZipWriter {
     let password: String?
     let legacyCrypto: Bool
     let level: Int            // 0 = store
+    let comment: String?
 
-    init(url: URL, password: String?, legacyCrypto: Bool = false, level: Int = 6) throws {
+    init(url: URL, password: String?, legacyCrypto: Bool = false, level: Int = 6, comment: String? = nil) throws {
         out = try FileOut(url)
         self.password = (password?.isEmpty ?? true) ? nil : password
         self.legacyCrypto = legacyCrypto
         self.level = level
+        self.comment = comment
     }
 
     private func extTime(_ d: Date) -> Data {
@@ -555,7 +644,11 @@ final class ZipWriter {
         var e = Data()
         e.put32(0x0605_4b50); e.put16(0); e.put16(0)
         e.put16(UInt16(min(records.count, 0xffff))); e.put16(UInt16(min(records.count, 0xffff)))
-        e.put32(UInt32(min(cdSize, 0xffff_ffff))); e.put32(UInt32(min(cdStart, 0xffff_ffff))); e.put16(0)
+        e.put32(UInt32(min(cdSize, 0xffff_ffff))); e.put32(UInt32(min(cdStart, 0xffff_ffff)))
+        let commentData = Data((comment ?? "").utf8)
+        let commLen = UInt16(min(commentData.count, 0xffff))
+        e.put16(commLen)
+        if commLen > 0 { e.append(commentData.prefix(Int(commLen))) }
         try out.write(e)
     }
 }

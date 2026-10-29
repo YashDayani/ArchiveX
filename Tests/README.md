@@ -66,6 +66,15 @@ Version ordering, release parsing, the `SHA256SUMS` reader, the GitHub-only down
 a good update reaches the installer; a tampered zip, another app, a version that is not newer, a missing checksum file and a non-GitHub
 location are all refused. Needs `ditto` and `codesign` (part of macOS).
 
+## Feature tests (`FeatureTests`)
+
+```bash
+swiftc -O -swift-version 5 Sources/Engine.swift Sources/Core/*.swift Tests/FeatureTests/main.swift -o /tmp/FeatureTests
+/tmp/FeatureTests <work-dir>
+```
+
+Tests archive comments (EOCD reading, writing, preservation through edits, verification with `/usr/bin/unzip`), multi-core parallel extraction and integrity testing across all CPU cores with 40+ files, and multi-volume split archive creation (`.zip.001`, `.7z.001`, `.tar.001`) with automatic part gathering and seamless byte-exact extraction.
+
 ## App tests (`AppTests`)
 
 Drives the real `ArchiveModel` (open → list → test → extract → edit) for every creatable format. Needs a work

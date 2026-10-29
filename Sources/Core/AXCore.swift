@@ -25,6 +25,8 @@ struct AXCreate {
     var deleteAfter = false
     var solid = true                    // 7z: one compressed block for all files
     var encryptNames = false            // 7z: encrypt the file list too
+    var comment: String? = nil
+    var splitVolumeSize: UInt64? = nil
 }
 
 struct AXItem {
@@ -43,8 +45,11 @@ enum AXCore {
     static func kind(of url: URL) -> AXKind? {
         var n = url.lastPathComponent.lowercased()
         if n.count > 4, let dot = n.lastIndex(of: "."), n.distance(from: dot, to: n.endIndex) == 4,
-           n[n.index(after: dot)...].allSatisfy({ $0.isASCII && $0.isNumber }), n[..<dot].hasSuffix(".7z") || n[..<dot].hasSuffix(".zip") {
-            n = String(n[..<dot])                                           // split archive: name.7z.001, name.zip.002, …
+           n[n.index(after: dot)...].allSatisfy({ $0.isASCII && $0.isNumber }) {
+            let baseExt = String(n[..<dot])
+            if baseExt.hasSuffix(".7z") || baseExt.hasSuffix(".zip") || baseExt.hasSuffix(".tar") || baseExt.hasSuffix(".rar") {
+                n = baseExt                                           // split archive: name.7z.001, name.zip.002, name.tar.001, …
+            }
         }
         if n.hasSuffix(".tar.gz") || n.hasSuffix(".tgz") || n.hasSuffix(".taz") { return .tgz }
         if n.hasSuffix(".tar.bz2") || n.hasSuffix(".tbz2") || n.hasSuffix(".tbz") || n.hasSuffix(".tb2") { return .tbz2 }
@@ -102,7 +107,7 @@ enum AXCore {
 
     /// Sequential decompressed stream of a single-stream or tar-in-compressor archive.
     private static func decoded(_ url: URL, _ k: AXKind) throws -> (ByteSource, FileIn) {
-        let f = try FileIn(url)
+        let f = try FileIn.openArchive(url)
         switch k {
         case .tgz, .gz: return (try GzipSource(file: f), f)
         case .tbz2, .bz2: return (try Bzip2Source(file: f), f)
@@ -149,7 +154,7 @@ enum AXCore {
             _ = f
             return l
         case .bz2, .xz, .zst:
-            let f = try FileIn(url)
+            let f = try FileIn.openArchive(url)
             _ = try decoded(url, k)
             var l = Listing()
             l.details = k == .xz ? "xz" : k == .zst ? "Zstandard" : "bzip2"
@@ -159,7 +164,7 @@ enum AXCore {
                                       crc: "", attrs: "", encrypted: false)]
             return l
         case .gz:
-            let f = try FileIn(url)
+            let f = try FileIn.openArchive(url)
             let g = try GzipSource(file: f)
             let name = streamName(url, k, g.storedName)
             var l = Listing()
@@ -376,10 +381,10 @@ enum AXCore {
     }
 
     private static func write(items: [AXItem], format: ArchiveFormat, to tmp: URL, level: Int, password: String?, legacy: Bool,
-                              progress: ProgressTracker) throws {
+                              comment: String? = nil, progress: ProgressTracker) throws {
         switch format {
         case .zip:
-            let w = try ZipWriter(url: tmp, password: password, legacyCrypto: legacy, level: level)
+            let w = try ZipWriter(url: tmp, password: password, legacyCrypto: legacy, level: level, comment: comment)
             for it in items {
                 try Task.checkCancellation()
                 switch it.kind {
@@ -413,29 +418,61 @@ enum AXCore {
         }
     }
 
-    private static func commit(_ tmp: URL, as final: URL) throws {
+    @discardableResult
+    private static func commit(_ tmp: URL, as final: URL, splitVolumeSize: UInt64? = nil) throws -> URL {
+        if let volSize = splitVolumeSize, volSize > 0 {
+            var baseName = final.lastPathComponent
+            if baseName.count > 4, let dot = baseName.lastIndex(of: "."), baseName[dot...].hasPrefix(".00") {
+                baseName = String(baseName[..<dot])
+            }
+            let dir = final.deletingLastPathComponent()
+            let file = try FileIn(tmp)
+            let total = file.size
+            var offset: UInt64 = 0
+            var partIndex = 1
+            let firstURL = dir.appendingPathComponent(baseName + ".001")
+            while offset < total || (total == 0 && partIndex == 1) {
+                let partURL = dir.appendingPathComponent(baseName + "." + String(format: "%03d", partIndex))
+                let partOut = try FileOut(partURL)
+                let toWrite = min(volSize, total - offset)
+                var written: UInt64 = 0
+                while written < toWrite {
+                    let chunk = Int(min(UInt64(1 << 20), toWrite - written))
+                    let d = try file.readExactly(at: offset + written, chunk)
+                    try partOut.write(d)
+                    written += UInt64(d.count)
+                }
+                offset += toWrite
+                partIndex += 1
+                if total == 0 { break }
+            }
+            try? FileManager.default.removeItem(at: tmp)
+            return firstURL
+        }
         if FileManager.default.fileExists(atPath: final.path) { _ = try FileManager.default.replaceItemAt(final, withItemAt: tmp) }
         else { try FileManager.default.moveItem(at: tmp, to: final) }
+        return final
     }
 
     static func create(_ spec: AXCreate, progress: @escaping (Double) -> Void) throws {
         let items = try collect(spec.items)
         let tracker = ProgressTracker(total: items.reduce(0) { $0 + Int64($1.size) }, report: progress)
         let tmp = spec.output.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).axtmp")
+        let finalOutput: URL
         do {
             if spec.format == .sevenZ { try writeSevenZ(items: items, to: tmp, spec: spec, progress: tracker) }
             else if spec.format == .rar { try writeRar(items: items, to: tmp, spec: spec, progress: tracker) }
             else {
                 try write(items: items, format: spec.format, to: tmp, level: spec.level, password: spec.password,
-                          legacy: spec.legacyZipCrypto, progress: tracker)
+                          legacy: spec.legacyZipCrypto, comment: spec.comment, progress: tracker)
             }
-            try commit(tmp, as: spec.output)
+            finalOutput = try commit(tmp, as: spec.output, splitVolumeSize: spec.splitVolumeSize)
         } catch {
             try? FileManager.default.removeItem(at: tmp)
             throw error
         }
         if spec.deleteAfter {
-            try test(spec.output, password: spec.password, progress: { _ in })      // never delete sources unverified
+            try test(finalOutput, password: spec.password, progress: { _ in })      // never delete sources unverified
             for r in spec.items { try? FileManager.default.removeItem(at: r) }
         }
     }
@@ -540,7 +577,8 @@ enum AXCore {
                 let arc = try ZipArchive(url: url)
                 let total = arc.entries.reduce(Int64(0)) { $0 + Int64($1.usize) } + newItems.reduce(0) { $0 + Int64($1.size) }
                 let tracker = ProgressTracker(total: total, report: progress)
-                let w = try ZipWriter(url: tmp, password: password, legacyCrypto: legacy, level: level)
+                let existingComment = arc.comment.isEmpty ? nil : (String(data: arc.comment, encoding: .utf8) ?? String(data: arc.comment, encoding: .isoLatin1))
+                let w = try ZipWriter(url: tmp, password: password, legacyCrypto: legacy, level: level, comment: existingComment)
                 let ordered = arc.entries.enumerated().sorted { $0.element.localOffset < $1.element.localOffset }
                 var ends: [Int: UInt64] = [:]
                 for (n, item) in ordered.enumerated() {

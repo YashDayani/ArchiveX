@@ -19,6 +19,7 @@ struct ArchiveInfo: Identifiable {
     var isEncrypted: Bool
     var encryptionDetails: String
     var details: String
+    var comment: String? = nil
 }
 
 struct AlertInfo: Identifiable {
@@ -28,6 +29,28 @@ struct AlertInfo: Identifiable {
     var actionTitle: String? = nil
     var isDestructive = false
     var action: (() -> Void)? = nil
+}
+
+enum SplitPreset: String, CaseIterable, Identifiable {
+    case none = "None"
+    case mb10 = "10 MB"
+    case mb100 = "100 MB"
+    case cd700 = "700 MB (CD)"
+    case fat32 = "4 GB (FAT32)"
+    case custom = "Custom…"
+
+    var id: String { rawValue }
+
+    var bytes: UInt64? {
+        switch self {
+        case .none: return nil
+        case .mb10: return 10 * 1024 * 1024
+        case .mb100: return 100 * 1024 * 1024
+        case .cd700: return 700 * 1024 * 1024
+        case .fat32: return 4_294_967_295
+        case .custom: return nil
+        }
+    }
 }
 
 struct AddDraft: Identifiable {
@@ -44,6 +67,9 @@ struct AddDraft: Identifiable {
     var confirm = ""
     var legacyZipCrypto = false   // ZIP only: PKWARE ZipCrypto (opens in macOS Archive Utility, but weak)
     var updatingExisting = false
+    var comment: String = ""
+    var splitPreset: SplitPreset = .none
+    var customSplitMB: Int = 100
 }
 
 struct ExtractDraft: Identifiable {
@@ -85,6 +111,7 @@ final class ArchiveModel: ObservableObject {
     @Published var searchQuery = ""
     @Published var hashResults: [ArchiveHasher.Result]?
     @Published var archiveInfo: ArchiveInfo?
+    @Published var archiveComment: String? = nil
     @Published var searchFieldFocused = false
 
     private var afterPassword: (() -> Void)?
@@ -188,6 +215,7 @@ final class ArchiveModel: ObservableObject {
                 self.entries = l.entries; self.details = l.details
                 self.packedPerFileUnknown = l.solid
                 self.packedTotal = l.totalPacked
+                self.archiveComment = l.comment
                 self.currentDir = ""
                 NSDocumentController.shared.noteNewRecentDocumentURL(url)
             case .failure(let e):
@@ -203,6 +231,7 @@ final class ArchiveModel: ObservableObject {
             if case .success(let l) = await run("Refreshing…", { _ in try AXCore.list(url, password: pw) }) {
                 entries = l.entries; details = l.details
                 packedPerFileUnknown = l.solid; packedTotal = l.totalPacked
+                archiveComment = l.comment
                 currentDir = entries.contains { $0.path.hasPrefix(dir + "/") } ? dir : ""
                 selection = []
             }
@@ -210,7 +239,7 @@ final class ArchiveModel: ObservableObject {
     }
 
     func close() {
-        archiveURL = nil; entries = []; details = ""; currentDir = ""; selection = []; password = nil
+        archiveURL = nil; entries = []; details = ""; currentDir = ""; selection = []; password = nil; archiveComment = nil
     }
 
     func goUp() {
@@ -452,7 +481,8 @@ final class ArchiveModel: ObservableObject {
             isSolid: packedPerFileUnknown,
             isEncrypted: isEnc,
             encryptionDetails: encStr,
-            details: details
+            details: details,
+            comment: archiveComment
         )
     }
 
@@ -589,6 +619,9 @@ final class ArchiveModel: ObservableObject {
         let level = (d.format == .sevenZ || d.format == .rar) ? d.level : (d.level == 0 ? 0 : 6)
         let pw: String? = d.password.isEmpty || !d.format.password ? nil : d.password
         let files = d.files
+        let volSize: UInt64? = d.splitPreset == .custom ? (UInt64(max(1, d.customSplitMB)) * 1024 * 1024) : d.splitPreset.bytes
+        let trimmedComment = d.comment.trimmingCharacters(in: .whitespacesAndNewlines)
+        let comment: String? = trimmedComment.isEmpty ? nil : trimmedComment
         Task {
             let res = await run("Compressing…") { p in
                 if edit {
@@ -597,13 +630,24 @@ final class ArchiveModel: ObservableObject {
                 } else {
                     try AXCore.create(AXCreate(format: d.format, output: target, items: files, level: level, password: pw,
                                                legacyZipCrypto: d.legacyZipCrypto, deleteAfter: d.deleteAfter,
-                                               solid: d.solid, encryptNames: d.encryptNames), progress: p)
+                                               solid: d.solid, encryptNames: d.encryptNames, comment: comment,
+                                               splitVolumeSize: volSize), progress: p)
                 }
-                if d.test { try AXCore.test(target, password: pw, progress: { _ in }) }
+                if d.test {
+                    let firstPart = target.deletingLastPathComponent().appendingPathComponent(target.lastPathComponent + ".001")
+                    let testTarget = (volSize != nil && FileManager.default.fileExists(atPath: firstPart.path)) ? firstPart : target
+                    try AXCore.test(testTarget, password: pw, progress: { _ in })
+                }
             }
             switch res {
             case .success:
-                if openAfter { refresh() } else { NSWorkspace.shared.activateFileViewerSelecting([target]) }
+                if openAfter {
+                    refresh()
+                } else {
+                    let firstPart = target.deletingLastPathComponent().appendingPathComponent(target.lastPathComponent + ".001")
+                    let selectTarget = (volSize != nil && FileManager.default.fileExists(atPath: firstPart.path)) ? firstPart : target
+                    NSWorkspace.shared.activateFileViewerSelecting([selectTarget])
+                }
             case .failure(let e): handle(e, title: "Compression failed") { }
             }
         }

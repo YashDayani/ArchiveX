@@ -23,6 +23,7 @@ struct Listing {
     var headerEncrypted = false
     /// Real packed size of the whole archive when per-file values are unknown (solid archives).
     var totalPacked: Int64?
+    var comment: String? = nil
 }
 
 // MARK: - Display rows (one folder level of the archive)

@@ -233,14 +233,22 @@ final class ProgressTracker {
     private(set) var done: Int64 = 0
     private let report: (Double) -> Void
     private var last = -1
+    private let lock = NSLock()
 
     init(total: Int64, report: @escaping (Double) -> Void) { self.total = max(total, 1); self.report = report }
 
     func add(_ n: Int) throws {
         try Task.checkCancellation()
+        var callReport: Double? = nil
+        lock.lock()
         done += Int64(n)
         let pct = min(100, Int(Double(done) / Double(total) * 100))
-        if pct != last { last = pct; report(Double(pct) / 100) }
+        if pct != last {
+            last = pct
+            callReport = Double(pct) / 100
+        }
+        lock.unlock()
+        if let p = callReport { report(p) }
     }
 }
 
@@ -268,9 +276,20 @@ final class Extractor {
     let overwrite: Overwrite
     let keepPaths: Bool
     let selection: [(path: String, isDir: Bool)]
-    private(set) var skippedUnsafe: [String] = []
+    private let lock = NSLock()
+    private var _skippedUnsafe: [String] = []
+    var skippedUnsafe: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _skippedUnsafe
+    }
     private var createdLinks: [URL] = []
-    private(set) var extracted = 0
+    private var _extracted = 0
+    var extracted: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _extracted
+    }
 
     init(destination: URL, overwrite: Overwrite, keepPaths: Bool, selection: [(path: String, isDir: Bool)]) throws {
         root = destination
@@ -304,7 +323,18 @@ final class Extractor {
                     cur = real
                 } else { cur = next }
             } else {
-                try fm.createDirectory(atPath: next, withIntermediateDirectories: false)
+                do {
+                    try fm.createDirectory(atPath: next, withIntermediateDirectories: false)
+                } catch {
+                    if lstat(next, &st) == 0 {
+                        if (st.st_mode & S_IFMT) == S_IFLNK {
+                            let real = URL(fileURLWithPath: next).resolvingSymlinksInPath().path
+                            guard inside(real) else { return nil }
+                            cur = real
+                            continue
+                        }
+                    } else { throw error }
+                }
                 cur = next
             }
             guard inside(cur) else { return nil }
@@ -314,16 +344,18 @@ final class Extractor {
 
     /// Where a member should be written, or nil to skip it (unsafe, or "skip existing").
     func destination(for rawName: String, isDir: Bool) throws -> URL? {
-        guard let rel = SafePath.clean(rawName) else { skippedUnsafe.append(rawName); return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let rel = SafePath.clean(rawName) else { _skippedUnsafe.append(rawName); return nil }
         let relative = keepPaths ? rel : (rel as NSString).lastPathComponent
         let fm = FileManager.default
-        guard let parent = try safeParent(of: relative) else { skippedUnsafe.append(rawName); return nil }
+        guard let parent = try safeParent(of: relative) else { _skippedUnsafe.append(rawName); return nil }
         var url = parent.appendingPathComponent((relative as NSString).lastPathComponent)
 
         if isDir {
             // never "create" a folder over a symlink: attributes would then be applied to wherever it points
-            if isSymlink(url) { skippedUnsafe.append(rawName); return nil }
-            extracted += 1
+            if isSymlink(url) { _skippedUnsafe.append(rawName); return nil }
+            _extracted += 1
             return url
         }
         if fm.fileExists(atPath: url.path) || (try? url.checkResourceIsReachable()) == true || isSymlink(url) {
@@ -333,7 +365,7 @@ final class Extractor {
             case .rename: url = uniqueName(url)
             }
         }
-        extracted += 1
+        _extracted += 1
         return url
     }
 
@@ -400,23 +432,27 @@ final class Extractor {
 
     /// Creates a symlink only when it stays inside the destination.
     func makeSymlink(at url: URL, target: String) {
-        guard !target.hasPrefix("/") else { skippedUnsafe.append(url.lastPathComponent + " → " + target); return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !target.hasPrefix("/") else { _skippedUnsafe.append(url.lastPathComponent + " → " + target); return }
         let dir = url.deletingLastPathComponent().resolvingSymlinksInPath().path
-        guard inside(dir), staysInside(target, from: dir) else { skippedUnsafe.append(url.lastPathComponent + " → " + target); return }
+        guard inside(dir), staysInside(target, from: dir) else { _skippedUnsafe.append(url.lastPathComponent + " → " + target); return }
         if (try? FileManager.default.createSymbolicLink(atPath: url.path, withDestinationPath: target)) != nil || FileManager.default.fileExists(atPath: url.path) {
             createdLinks.append(url)
             if !inside(url.resolvingSymlinksInPath().path) {                      // belt and braces: check the result too
                 try? FileManager.default.removeItem(at: url); createdLinks.removeLast()
-                skippedUnsafe.append(url.lastPathComponent + " → " + target)
+                _skippedUnsafe.append(url.lastPathComponent + " → " + target)
             }
         }
     }
 
     /// Final sweep: entries extracted later may have changed what an earlier symlink resolves to.
     func verifyLinks() {
+        lock.lock()
+        defer { lock.unlock() }
         for u in createdLinks where !inside(u.resolvingSymlinksInPath().path) {
             try? FileManager.default.removeItem(at: u)
-            skippedUnsafe.append(u.lastPathComponent + " (link would leave the destination)")
+            _skippedUnsafe.append(u.lastPathComponent + " (link would leave the destination)")
         }
     }
 }
