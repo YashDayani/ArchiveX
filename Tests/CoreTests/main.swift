@@ -1111,12 +1111,54 @@ do {
             if label == "UDZO" { let l = try AXCore.list(out, password: nil); check("dmg: listing names the volume and format", l.details.contains("DMGTEST") && l.details.contains("zlib") && l.entries.contains { $0.path == "Deep Folder/Another Level/text.txt" }, l.details) }
         } catch { check("dmg [\(label)]", false, "\(error)") }
     }
-    // an APFS image is recognised and refused with a clear message
-    let apfsDmg = dmgDir.appendingPathComponent("t-apfs.dmg")
-    if sh("/usr/bin/hdiutil create -quiet -srcfolder \(q(dmgSrc)) -fs APFS -volname APFSTEST -format UDZO \(q(apfsDmg))").status == 0 {
-        do { _ = try AXCore.list(apfsDmg, password: nil); check("dmg [APFS]: reported as unsupported", false) }
-        catch AXError.unsupported(let m) { check("dmg [APFS]: reported as unsupported", m.contains("APFS"), m) } catch { check("dmg [APFS]: reported as unsupported", false, "\(error)") }
+    // APFS volumes inside disk images (default GPT layout), checked against what macOS mounts
+    var apfsRef: URL?
+    for (label, fmt) in [("UDZO", "UDZO"), ("ULFO", "ULFO"), ("UDRO", "UDRO")] {
+        let out = dmgDir.appendingPathComponent("t-apfs-\(label).dmg")
+        let mk = sh("/usr/bin/hdiutil create -quiet -srcfolder \(q(dmgSrc)) -fs APFS -volname APFSTEST -format \(fmt) \(q(out))")
+        if mk.status != 0 { check("dmg APFS [\(label)]: created by hdiutil", false, mk.out.suffix(160).description); continue }
+        if apfsRef == nil {
+            let mnt = work.appendingPathComponent("apfs-mount"); try fm.createDirectory(at: mnt, withIntermediateDirectories: true)
+            if sh("/usr/bin/hdiutil attach -quiet -readonly -nobrowse -noverify -mountpoint \(q(mnt)) \(q(out))").status == 0 {
+                let r = work.appendingPathComponent("apfs-ref"); try fm.createDirectory(at: r, withIntermediateDirectories: true)
+                sh("/bin/cp -R \(q(mnt))/ \(q(r))/")
+                sh("/usr/bin/hdiutil detach -quiet -force \(q(mnt))")
+                apfsRef = r
+            }
+        }
+        do {
+            let ours = try extractOurs(out, to: "own-apfs-\(label)")
+            if let r = apfsRef { check("dmg APFS [\(label)]: matches what macOS mounts", sameContent(r, ours) == nil, sameContent(r, ours) ?? "") }
+            check("dmg APFS [\(label)]: bytes, symlink and hard link are right",
+                  (try? Data(contentsOf: ours.appendingPathComponent("Deep Folder/random.bin"))) == (try? Data(contentsOf: dmgSrc.appendingPathComponent("Deep Folder/random.bin")))
+                  && (try? Data(contentsOf: ours.appendingPathComponent("hardlink-to-a.txt"))) == (try? Data(contentsOf: dmgSrc.appendingPathComponent("a.txt")))
+                  && (try? fm.destinationOfSymbolicLink(atPath: ours.appendingPathComponent("link-to-a").path)) == "a.txt")
+            try AXCore.test(out, password: nil, progress: { _ in })
+            if label == "UDZO" { let l = try AXCore.list(out, password: nil); check("dmg APFS: listing names the volume and format", l.details.contains("APFSTEST") && l.details.contains("APFS"), l.details) }
+        } catch { check("dmg APFS [\(label)]", false, "\(error)") }
     }
+    // transparently compressed files (decmpfs, stored in the resource fork) on an APFS volume
+    do {
+        let sparse = dmgDir.appendingPathComponent("cmp.sparseimage"); try? fm.removeItem(at: sparse)
+        let mnt = work.appendingPathComponent("apfs-cmp-mount"); try fm.createDirectory(at: mnt, withIntermediateDirectories: true)
+        let cs = work.appendingPathComponent("cmp-src"); try fm.createDirectory(at: cs, withIntermediateDirectories: true)
+        try Data((1...150_000).map { "compressible line \($0) \(["alpha", "beta", "gamma"][$0 % 3])\n" }.joined().utf8).write(to: cs.appendingPathComponent("big.txt"))
+        try Data((1...6000).map { "mid line \($0)\n" }.joined().utf8).write(to: cs.appendingPathComponent("mid.txt"))
+        if sh("/usr/bin/hdiutil create -quiet -size 80m -fs APFS -volname CMPTEST -type SPARSE \(q(sparse))").status == 0,
+           sh("/usr/bin/hdiutil attach -quiet -nobrowse -mountpoint \(q(mnt)) \(q(sparse))").status == 0 {
+            sh("/usr/bin/ditto --hfsCompression \(q(cs)) \(q(mnt))/")
+            let flags = sh("/bin/ls -lO \(q(mnt)) | grep -c compressed").out.trimmingCharacters(in: .whitespacesAndNewlines)
+            sh("/usr/bin/hdiutil detach -quiet -force \(q(mnt))")
+            let cdmg = dmgDir.appendingPathComponent("cmp.dmg"); try? fm.removeItem(at: cdmg)
+            sh("/usr/bin/hdiutil convert -quiet \(q(sparse)) -format UDZO -o \(q(cdmg))")
+            check("dmg APFS: test volume really holds compressed files", (Int(flags) ?? 0) >= 1, flags)
+            let ours = try extractOurs(cdmg, to: "own-apfs-cmp")
+            check("dmg APFS: transparently compressed files decode to the original bytes",
+                  (try? Data(contentsOf: ours.appendingPathComponent("big.txt"))) == (try? Data(contentsOf: cs.appendingPathComponent("big.txt")))
+                  && (try? Data(contentsOf: ours.appendingPathComponent("mid.txt"))) == (try? Data(contentsOf: cs.appendingPathComponent("mid.txt"))))
+            try AXCore.test(cdmg, password: nil, progress: { _ in })
+        }
+    } catch { check("dmg APFS compressed files", false, "\(error)") }
     if let anyDmg = (try? fm.contentsOfDirectory(atPath: dmgDir.path))?.first(where: { $0.hasPrefix("t-UDZO") }) {
         var d = try Data(contentsOf: dmgDir.appendingPathComponent(anyDmg)); d.removeSubrange(d.count / 3..<d.count / 3 + 4000)
         let bad = work.appendingPathComponent("bad.dmg"); try d.write(to: bad)

@@ -45,19 +45,20 @@
 | **RAR 3 / RAR 4** — LZ and PPMd text compression, all six filters, AES-128, encrypted file names, solid, multi-volume sets (`.part01.rar`, `.rar`/`.r00`) | ✅ | ❌ ¹ | ❌ |
 | **TAR** (ustar, pax, GNU) | ✅ | ✅ | ✅ |
 | **TAR.GZ · TAR.BZ2 · TAR.XZ** | ✅ | ✅ | — |
+| **Zstandard** (`.zst`, `.tar.zst`, zstd RPMs) | ✅ | — | — |
 | **GZ · BZ2 · XZ** single files | ✅ | — | — |
 | **ISO 9660** (Joliet, Rock Ridge) | ✅ | — | — |
 | **CPIO** (newc, odc) | ✅ | — | — |
-| **DMG** disk images (zlib, bzip2, LZFSE, LZMA, raw; Apple/GPT/no partition map) with **HFS+** volumes | ✅ | — | — |
+| **DMG** disk images (zlib, bzip2, LZFSE, LZMA, raw; Apple/GPT/no partition map) with **HFS+** and **APFS** volumes (including transparently compressed files) | ✅ | — | — |
 | **PKG / XAR** (macOS installer packages) | ✅ | — | — |
 | **DEB · AR · RPM** (gzip / bzip2 / xz payloads) | ✅ | — | — |
 | **CAB** (stored, MSZIP) · **.Z** (compress) | ✅ | — | — |
 
 ¹ RARLAB's license reserves the RAR compression algorithm, so ArchiveX can read RAR but will never create it.
 
-**Not supported (yet):** RAR 1.x / 2.x (pre-2000 archives), multi-volume RAR 5, DMG images that hold **APFS** volumes
-(or HFS+ files with transparent compression), CAB files using LZX or Quantum, RPM packages compressed with zstd, WIM, ARJ,
-LZH, Info-ZIP style `.z01` spanned ZIPs, ZIP archives that use PPMd. ArchiveX tells you plainly when it meets one of these.
+**Not supported (yet):** RAR 1.x / 2.x (pre-2000 archives), multi-volume RAR 5, encrypted APFS volumes, APFS snapshots,
+files compressed with the old zlib resource-fork layout, CAB files using LZX or Quantum, Zstandard data that needs a
+dictionary, WIM, ARJ, LZH, Info-ZIP style `.z01` spanned ZIPs, ZIP archives that use PPMd. ArchiveX tells you plainly when it meets one of these.
 
 ## Install
 

@@ -321,17 +321,17 @@ final class HfsVolume {
 // MARK: - the archive
 
 final class DmgArchive: ContainerArchive {
-    private var volumes: [(name: String, vol: HfsVolume)] = []
-    private var map: [(vol: Int, node: HfsVolume.Node)] = []
+    private struct Mounted { var name: String; var kind: String; var items: [ContainerItem]; var open: (Int) throws -> ByteSource }
+    private var mounted: [Mounted] = []
+    private var map: [(vol: Int, index: Int)] = []
     private(set) var items: [ContainerItem] = []
     private(set) var details = "DMG"
 
     init(url: URL) throws {
         let image = try DmgImage(url: url)
-        var starts: [UInt64] = []
-        var sawAPFS = false
+        var hfs: [UInt64] = [], apfs: [UInt64] = []
         let head = try image.read(at: 0, 4096)
-        func apfs(at s: UInt64) -> Bool { ((try? image.read(at: s + 32, 4)) ?? Data()) == Data("NXSB".utf8) }
+        func classify(_ s: UInt64) { if HfsVolume.probe(image, at: s) { hfs.append(s) } else if ApfsVolume.probe(image, at: s) { apfs.append(s) } }
         if head.count >= 1024, head.prefix(2) == Data("ER".utf8), head[head.startIndex + 512] == 0x50, head[head.startIndex + 513] == 0x4d {
             // Apple Partition Map
             let bs = UInt64(be16(head, 2))
@@ -339,8 +339,7 @@ final class DmgArchive: ContainerArchive {
             for i in 0..<min(count, 128) {
                 let e = try image.read(at: 512 + UInt64(i) * 512, 512)
                 guard e.count == 512, e[e.startIndex] == 0x50, e[e.startIndex + 1] == 0x4d else { break }
-                let s = UInt64(be32(e, 8)) * max(bs, 512)
-                if HfsVolume.probe(image, at: s) { starts.append(s) } else if apfs(at: s) { sawAPFS = true }
+                classify(UInt64(be32(e, 8)) * max(bs, 512))
             }
         } else if head.count >= 1024, head.subdata(in: head.startIndex + 512..<head.startIndex + 520) == Data("EFI PART".utf8) {
             let g = head.subdata(in: head.startIndex + 512..<head.startIndex + 1024)
@@ -353,29 +352,40 @@ final class DmgArchive: ContainerArchive {
                     let e = raw.subdata(in: raw.startIndex + i * esz..<raw.startIndex + (i + 1) * esz)
                     if e.prefix(16).allSatisfy({ $0 == 0 }) { continue }
                     let first = (0..<8).reduce(UInt64(0)) { $0 | UInt64(e[e.startIndex + 32 + $1]) << UInt64(8 * $1) }
-                    if HfsVolume.probe(image, at: first * 512) { starts.append(first * 512) } else if apfs(at: first * 512) { sawAPFS = true }
+                    classify(first * 512)
                 }
             }
-        } else if HfsVolume.probe(image, at: 0) { starts = [0] } else if apfs(at: 0) { sawAPFS = true }
+        } else { classify(0) }
 
-        for s in starts {
+        for s in hfs {
             let v = try HfsVolume(disk: image, start: s)
-            volumes.append((v.name, v))
+            let its = v.nodes.map { n in ContainerItem(path: n.path, isDir: n.isDir, size: n.size, packed: n.size, mtime: n.mtime, mode: n.mode, link: n.link) }
+            mounted.append(Mounted(name: v.name, kind: "HFS+", items: its, open: { try v.stream(v.nodes[$0]) }))
         }
-        guard !volumes.isEmpty else {
-            if sawAPFS { throw AXError.unsupported("this disk image holds an APFS volume (ArchiveX reads HFS+ disk images)") }
-            throw AXError.unsupported("this disk image’s file system (ArchiveX reads HFS+ volumes)")
-        }
-        let multi = volumes.count > 1
-        for (vi, v) in volumes.enumerated() {
-            let prefix = multi ? (v.name.isEmpty ? "Volume \(vi + 1)" : v.name) + "/" : ""
-            for n in v.vol.nodes {
-                map.append((vi, n))
-                items.append(ContainerItem(path: prefix + n.path, isDir: n.isDir, size: n.size, packed: n.size, mtime: n.mtime, mode: n.mode, link: n.link))
+        for s in apfs {
+            var index = 0
+            while true {
+                guard let v = try? ApfsVolume(disk: image, start: s, volumeIndex: index) else {
+                    if index == 0 { _ = try ApfsVolume(disk: image, start: s, volumeIndex: 0) }          // surface the real error
+                    break
+                }
+                let its = v.nodes.map { n in ContainerItem(path: n.path, isDir: n.isDir, size: n.size, packed: n.size, mtime: n.mtime, mode: n.mode, link: n.link) }
+                mounted.append(Mounted(name: v.name, kind: "APFS", items: its, open: { try v.stream(v.nodes[$0]) }))
+                index += 1
             }
         }
-        details = "DMG · \(image.methods.sorted().joined(separator: ", ")) · HFS+" + (volumes.count == 1 && !volumes[0].name.isEmpty ? " “\(volumes[0].name)”" : "")
+        guard !mounted.isEmpty else { throw AXError.unsupported("this disk image’s file system (ArchiveX reads HFS+ and APFS volumes)") }
+        let multi = mounted.count > 1
+        for (vi, v) in mounted.enumerated() {
+            let prefix = multi ? (v.name.isEmpty ? "Volume \(vi + 1)" : v.name) + "/" : ""
+            for (i, it) in v.items.enumerated() {
+                var c = it; c.path = prefix + it.path
+                map.append((vi, i)); items.append(c)
+            }
+        }
+        let kinds = Array(Set(mounted.map(\.kind))).sorted().joined(separator: ", ")
+        details = "DMG · \(image.methods.sorted().joined(separator: ", ")) · \(kinds)" + (mounted.count == 1 && !mounted[0].name.isEmpty ? " “\(mounted[0].name)”" : "")
     }
 
-    func stream(_ i: Int) throws -> ByteSource { try volumes[map[i].vol].vol.stream(map[i].node) }
+    func stream(_ i: Int) throws -> ByteSource { try mounted[map[i].vol].open(map[i].index) }
 }
