@@ -3,13 +3,13 @@ import Foundation
 // The façade the app talks to. Every function here is synchronous and cancellable
 // (Task.checkCancellation), so the model runs them on a background task.
 
-enum AXKind { case zip, tar, gz, tgz, bz2, tbz2, xz, txz, zst, tzst, sevenZ, rar, iso, cpio, ar, lzw, rpm, xar, cab, dmg }
+enum AXKind { case zip, tar, gz, tgz, bz2, tbz2, xz, txz, zst, tzst, sevenZ, rar, iso, cpio, ar, lzw, rpm, xar, cab, dmg, lzma }
 
 extension AXKind {
     /// kinds whose payload is one compressed stream
     var isStream: Bool { self == .gz || self == .bz2 || self == .xz || self == .zst }
     /// kinds handled through the generic `ContainerArchive` layer
-    var isContainer: Bool { self == .ar || self == .lzw || self == .rpm || self == .xar || self == .cab || self == .dmg }
+    var isContainer: Bool { self == .ar || self == .lzw || self == .rpm || self == .xar || self == .cab || self == .dmg || self == .lzma }
     /// kinds that are a tar inside a compressor
     var isCompressedTar: Bool { self == .tgz || self == .tbz2 || self == .txz || self == .tzst }
     var isTarLike: Bool { self == .tar || isCompressedTar }
@@ -63,6 +63,7 @@ enum AXCore {
         if n.hasSuffix(".cab") { return .cab }
         if n.hasSuffix(".dmg") { return .dmg }
         if n.hasSuffix(".z") { return .lzw }
+        if n.hasSuffix(".lzma") { return .lzma }
         if n.hasSuffix(".rar") { return .rar }
         if n.count > 4, let dot = n.lastIndex(of: "."), n.distance(from: dot, to: n.endIndex) == 4 {       // old volume names: .r00 … .r99, .s00 …
             let ext = n[n.index(after: dot)...]
@@ -81,6 +82,7 @@ enum AXCore {
         case .xar: return try XarArchive(url: url)
         case .cab: return try CabArchive(url: url)
         case .dmg: return try DmgArchive(url: url)
+        case .lzma: return try LzmaAloneArchive(url: url)
         default: throw AXError.unsupported(url.pathExtension)
         }
     }
@@ -129,7 +131,7 @@ enum AXCore {
             return try IsoArchive(url: url).listing
         case .cpio:
             return try CpioArchive(url: url).listing
-        case .ar, .lzw, .rpm, .xar, .cab, .dmg:
+        case .ar, .lzw, .rpm, .xar, .cab, .dmg, .lzma:
             return Container.listing(try container(url, k))
         case .tar, .tgz, .tbz2, .txz, .tzst:
             let (src, f) = try tarSource(url, k)
@@ -183,7 +185,7 @@ enum AXCore {
             let total = z.entries.filter { !$0.isDir && (selection.isEmpty || ex.isSelected(SafePath.clean($0.name) ?? "")) }
                 .reduce(Int64(0)) { $0 + Int64($1.usize) }
             try z.extract(selection: selection, to: ex, password: password, progress: ProgressTracker(total: total, report: progress))
-        case .ar, .lzw, .rpm, .xar, .cab, .dmg:
+        case .ar, .lzw, .rpm, .xar, .cab, .dmg, .lzma:
             let z = try container(url, k)
             try Container.extract(z, to: ex, progress: ProgressTracker(total: Container.total(z), report: progress))
         case .iso:
@@ -271,7 +273,7 @@ enum AXCore {
             let z = try ZipArchive(url: url)
             let total = z.entries.reduce(Int64(0)) { $0 + Int64($1.usize) }
             try z.test(password: password, progress: ProgressTracker(total: total, report: progress))
-        case .ar, .lzw, .rpm, .xar, .cab, .dmg:
+        case .ar, .lzw, .rpm, .xar, .cab, .dmg, .lzma:
             let z = try container(url, k)
             try Container.test(z, progress: ProgressTracker(total: Container.total(z), report: progress))
         case .iso:

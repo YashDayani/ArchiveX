@@ -1243,6 +1243,20 @@ do {
         var zdet2 = false; do { try AXCore.test(ztr, password: nil, progress: { _ in }) } catch { zdet2 = true }
         check("zstd: truncated data is detected", zdet2)
     }
+
+    // lzma-alone (.lzma) from the xz tool
+    if let XZ = ["/opt/homebrew/bin/xz", "/usr/local/bin/xz"].first(where: { fm.isExecutableFile(atPath: $0) }) {
+        for (f, opts) in [("text.txt", "-6"), ("text.txt", "-1"), ("noise.bin", "-3"), ("tiny.txt", "-6")] {
+            let zs = work.appendingPathComponent("zst")
+            let z = zs.appendingPathComponent("\(f).\(opts).lzma")
+            sh("\(XZ) --format=lzma -c \(opts) \(f) > \(q(z))", cwd: zs)
+            do {
+                let ours = try extractOurs(z, to: "own-lzma-\(f)\(opts)")
+                check("lzma-alone [\(f) \(opts)]: round trip", (try? Data(contentsOf: ours.appendingPathComponent("\(f).\(opts)"))) == (try Data(contentsOf: zs.appendingPathComponent(f))))
+                try AXCore.test(z, password: nil, progress: { _ in })
+            } catch { check("lzma-alone [\(f) \(opts)]", false, "\(error)") }
+        }
+    }
 } catch { check("section 12 threw", false, "\(error)") }
 
 print("\nRESULT: \(passed) passed, \(failed) failed")

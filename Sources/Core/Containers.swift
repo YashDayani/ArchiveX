@@ -574,3 +574,30 @@ final class CabArchive: ContainerArchive {
         return LimitSource(src, limit: items[i].size)
     }
 }
+
+
+// MARK: - lzma-alone (.lzma)
+
+final class LzmaAloneArchive: ContainerArchive {
+    private let file: FileIn
+    private let props: Data
+    private let size: UInt64?
+    let items: [ContainerItem]
+    let details = "LZMA"
+    init(url: URL) throws {
+        file = try FileIn(url)
+        let h = try file.readExactly(at: 0, 13)
+        props = h.prefix(5)
+        guard h[h.startIndex] < 225 else { throw AXError.corrupt("not an LZMA file") }
+        let sz = (0..<8).reduce(UInt64(0)) { $0 | UInt64(h[h.startIndex + 5 + $1]) << UInt64(8 * $1) }
+        size = sz == UInt64.max ? nil : sz
+        var name = url.lastPathComponent
+        if name.lowercased().hasSuffix(".lzma") { name.removeLast(5) }
+        items = [ContainerItem(path: name, size: size ?? 0, sizeKnown: size != nil, packed: file.size)]
+    }
+    func stream(_ i: Int) throws -> ByteSource {
+        let src = FileSource(file)
+        try src.skip(13)
+        return try LzmaSource(input: src, props: props, unpackSize: size ?? UInt64.max / 2)
+    }
+}
