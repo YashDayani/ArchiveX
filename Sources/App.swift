@@ -105,15 +105,13 @@ enum AboutPanel {
 
         let linkAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11),
-            .link: URL(string: "https://github.com/YashDayani/ArchiveX")!,
+            .link: URL(string: "https://github.com/YashDayani")!,
             .paragraphStyle: pStyle
         ]
 
         let credits = NSMutableAttributedString()
         credits.append(NSAttributedString(string: "Created by ", attributes: normalAttrs))
         credits.append(NSAttributedString(string: "Yash Dayani", attributes: linkAttrs))
-        credits.append(NSAttributedString(string: "\n", attributes: normalAttrs))
-        credits.append(NSAttributedString(string: "github.com/YashDayani/ArchiveX", attributes: linkAttrs))
 
         NSApp.orderFrontStandardAboutPanel(options: [
             .credits: credits
