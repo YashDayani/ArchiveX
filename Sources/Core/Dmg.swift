@@ -131,6 +131,7 @@ final class HfsVolume {
         var mode: UInt32?
         var link: String?
         var fork = Fork()
+        var rsrc = Fork()
         var fileID = 0
         var compressed = false
     }
@@ -141,6 +142,8 @@ final class HfsVolume {
     private(set) var blockSize = 0
     private var overflow: [String: [Extent]] = [:]
     private var catalog = Fork()
+    private var attributes = Fork()
+    private var decmpfs: [Int: [UInt8]] = [:]
     private var nodeSize = 0
     private(set) var nodes: [Node] = []
 
@@ -169,11 +172,11 @@ final class HfsVolume {
     }
 
     /// Reads `count` bytes of a fork starting at `offset`.
-    private func readFork(_ f: Fork, fileID: Int, at offset: UInt64, _ count: Int) throws -> Data {
+    private func readFork(_ f: Fork, fileID: Int, at offset: UInt64, _ count: Int, rsrc: Bool = false) throws -> Data {
         var out = Data()
         var pos = offset
         let end = min(offset + UInt64(count), f.size)
-        let ext = extents(of: f, fileID: fileID)
+        let ext = extents(of: f, fileID: fileID, rsrc: rsrc)
         while pos < end {
             var blockIndex = Int(pos / UInt64(blockSize))
             var found: Extent?
@@ -230,6 +233,7 @@ final class HfsVolume {
         guard blockSize >= 512, blockSize & (blockSize - 1) == 0, blockSize <= 1 << 26 else { throw AXError.corrupt("bad HFS+ block size") }
         let extentsFork = fork(h, 192)
         catalog = fork(h, 272)
+        attributes = fork(h, 352)
         // the extents-overflow tree lists the extents beyond the first eight of any file
         if extentsFork.size > 0 {
             for (key, rec) in try leafRecords(extentsFork, fileID: 3) where key.count >= 10 && rec.count >= 64 {
@@ -240,6 +244,7 @@ final class HfsVolume {
             }
         }
         try loadCatalog()
+        try loadCompressionAttributes()
     }
 
     private func loadCatalog() throws {
@@ -261,7 +266,7 @@ final class HfsVolume {
                 var n = Node(); n.mtime = date(16); n.fileID = be32(rec, 8)
                 let fmode = UInt32(be16(rec, 42))
                 n.mode = fmode & 0o7777
-                n.fork = fork(rec, 88); n.size = n.fork.size
+                n.fork = fork(rec, 88); n.size = n.fork.size; n.rsrc = fork(rec, 168)
                 n.compressed = rec[rec.startIndex + 41] & 0x20 != 0
                 let fileType = be32(rec, 48), creator = be32(rec, 52)
                 var hard: Int?
@@ -291,7 +296,7 @@ final class HfsVolume {
                 }
                 var node = r.node
                 if let h = r.hardLink, let target = inodes["iNode\(h)"] {
-                    node.fork = target.node.fork; node.size = target.node.size; node.fileID = target.node.fileID; node.compressed = target.node.compressed
+                    node.fork = target.node.fork; node.rsrc = target.node.rsrc; node.size = target.node.size; node.fileID = target.node.fileID; node.compressed = target.node.compressed
                 }
                 node.path = prefix + r.name.replacingOccurrences(of: "/", with: ":")
                 nodes.append(node)
@@ -301,7 +306,30 @@ final class HfsVolume {
         walk(2, "", depth: 0)
     }
 
+    /// Compressed files keep their "com.apple.decmpfs" header in the attributes tree.
+    private func loadCompressionAttributes() throws {
+        guard attributes.size > 0, nodes.contains(where: { $0.compressed }) else { return }
+        for (key, rec) in try leafRecords(attributes, fileID: 8) where key.count >= 12 && rec.count >= 16 {
+            let fid = be32(key, 2), nl = be16(key, 10)
+            guard key.count >= 12 + nl * 2, be32(rec, 0) == 0x10 else { continue }
+            let nm = String(decoding: (0..<nl).map { UInt16(be16(key, 12 + $0 * 2)) }, as: UTF16.self)
+            let len = be32(rec, 12)
+            if nm == "com.apple.decmpfs", rec.count >= 16 + len { decmpfs[fid] = [UInt8](rec.subdata(in: rec.startIndex + 16..<rec.startIndex + 16 + len)) }
+        }
+        for i in nodes.indices where nodes[i].compressed {
+            if let cm = decmpfs[nodes[i].fileID], cm.count >= 16 {
+                nodes[i].size = (0..<8).reduce(UInt64(0)) { $0 | UInt64(cm[8 + $1]) << UInt64(8 * $1) }       // uncompressed size (little-endian)
+            }
+        }
+    }
+
     func stream(_ n: Node) throws -> ByteSource {
+        if n.compressed, let cm = decmpfs[n.fileID] {
+            return MemorySource(try Decmpfs.decode(cm) {
+                let f = n.rsrc
+                return try self.readFork(f, fileID: n.fileID, at: 0, Int(f.size), rsrc: true)
+            })
+        }
         if n.compressed && n.size == 0 { throw AXError.unsupported("HFS+ files stored with transparent compression") }
         final class S: ByteSource {
             let v: HfsVolume; let n: Node; var pos: UInt64 = 0

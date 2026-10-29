@@ -1220,6 +1220,26 @@ do {
             try AXCore.test(cdmg, password: nil, progress: { _ in })
         }
     } catch { check("dmg APFS compressed files", false, "\(error)") }
+    // the same on an HFS+ volume (the decmpfs header then lives in the attributes tree)
+    do {
+        let sparse = dmgDir.appendingPathComponent("hcmp.sparseimage"); try? fm.removeItem(at: sparse)
+        let mnt = work.appendingPathComponent("hfs-cmp-mount"); try fm.createDirectory(at: mnt, withIntermediateDirectories: true)
+        let cs = work.appendingPathComponent("cmp-src")
+        if sh("/usr/bin/hdiutil create -quiet -size 80m -fs HFS+ -volname HCMPTEST -type SPARSE \(q(sparse))").status == 0,
+           sh("/usr/bin/hdiutil attach -quiet -nobrowse -mountpoint \(q(mnt)) \(q(sparse))").status == 0 {
+            sh("/usr/bin/ditto --hfsCompression \(q(cs)) \(q(mnt))/")
+            let flags = sh("/bin/ls -lO \(q(mnt)) | grep -c compressed").out.trimmingCharacters(in: .whitespacesAndNewlines)
+            sh("/usr/bin/hdiutil detach -quiet -force \(q(mnt))")
+            let cdmg = dmgDir.appendingPathComponent("hcmp.dmg"); try? fm.removeItem(at: cdmg)
+            sh("/usr/bin/hdiutil convert -quiet \(q(sparse)) -format UDZO -o \(q(cdmg))")
+            check("dmg HFS+: test volume really holds compressed files", (Int(flags) ?? 0) >= 1, flags)
+            let ours = try extractOurs(cdmg, to: "own-hfs-cmp")
+            check("dmg HFS+: transparently compressed files decode to the original bytes",
+                  (try? Data(contentsOf: ours.appendingPathComponent("big.txt"))) == (try? Data(contentsOf: cs.appendingPathComponent("big.txt")))
+                  && (try? Data(contentsOf: ours.appendingPathComponent("mid.txt"))) == (try? Data(contentsOf: cs.appendingPathComponent("mid.txt"))))
+            try AXCore.test(cdmg, password: nil, progress: { _ in })
+        }
+    } catch { check("dmg HFS+ compressed files", false, "\(error)") }
     if let anyDmg = (try? fm.contentsOfDirectory(atPath: dmgDir.path))?.first(where: { $0.hasPrefix("t-UDZO") }) {
         var d = try Data(contentsOf: dmgDir.appendingPathComponent(anyDmg)); d.removeSubrange(d.count / 3..<d.count / 3 + 4000)
         let bad = work.appendingPathComponent("bad.dmg"); try d.write(to: bad)

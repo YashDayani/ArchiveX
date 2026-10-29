@@ -251,20 +251,34 @@ final class ApfsVolume {
     func stream(_ n: Node) throws -> ByteSource {
         guard let ino = inodes[n.inode] else { throw AXError.corrupt("missing APFS inode") }
         if ino.bsdFlags & 0x20 != 0, let cm = xattrs[n.inode]?["com.apple.decmpfs"]?.embedded {
-            return MemorySource(try decompress(cm, inode: n.inode))
+            return MemorySource(try Decmpfs.decode(cm) { try self.resourceFork(n.inode) })
         }
         return readStream(id: ino.privateID, size: n.size)
     }
 
-    // MARK: transparent compression (decmpfs)
-
-    private func rsrcFork(_ id: UInt64) throws -> Data {
+    fileprivate func resourceFork(_ id: UInt64) throws -> Data {
         guard let x = xattrs[id]?["com.apple.ResourceFork"] else { throw AXError.corrupt("missing resource fork of a compressed file") }
         if let e = x.embedded { return Data(e) }
         return try readStream(id: x.streamID, size: x.streamSize).readAll(limit: Int(x.streamSize) + 1)
     }
+}
 
-    private func lzDecode(_ src: Data, _ want: Int, _ algo: compression_algorithm) throws -> Data {
+private final class ApfsStream: ByteSource {
+    let v: ApfsVolume; let id: UInt64; let size: UInt64; var pos: UInt64 = 0
+    init(_ v: ApfsVolume, id: UInt64, size: UInt64) { self.v = v; self.id = id; self.size = size }
+    func read(_ n: Int) throws -> Data {
+        guard pos < size else { return Data() }
+        let d = try v.readExtents(id, at: pos, Int(min(UInt64(n), size - pos, 1 << 20)))
+        pos += UInt64(d.count)
+        return d
+    }
+    func skip(_ n: UInt64) throws { try discard(n) }
+}
+
+/// Transparent file compression ("decmpfs") shared by HFS+ and APFS: a small header (`fpmc`, type, size) followed by inline data,
+/// or the data lives in the resource fork as a table of 64 KB blocks.
+enum Decmpfs {
+    static func lzDecode(_ src: Data, _ want: Int, _ algo: compression_algorithm) throws -> Data {
         var dst = Data(count: want)
         let n = dst.withUnsafeMutableBytes { d in src.withUnsafeBytes { s in
             compression_decode_buffer(d.bindMemory(to: UInt8.self).baseAddress!, want, s.bindMemory(to: UInt8.self).baseAddress!, src.count, nil, algo)
@@ -273,7 +287,7 @@ final class ApfsVolume {
         return dst
     }
 
-    private func decompress(_ cm: [UInt8], inode: UInt64) throws -> Data {
+    static func decode(_ cm: [UInt8], resource: () throws -> Data) throws -> Data {
         guard cm.count >= 16, Array(cm[0..<4]) == Array("fpmc".utf8) else { throw AXError.corrupt("bad compression header") }
         let type = l32(cm, 4), size = Int(l64(cm, 8))
         guard size < 1 << 32 else { throw AXError.unsupported("huge compressed files") }
@@ -284,21 +298,18 @@ final class ApfsVolume {
             return try lzDecode(d, want, lzvn ? compression_algorithm(rawValue: 0x900) : COMPRESSION_LZFSE)
         }
         switch type {
-        case 3, 7, 11:
-            return try block(inline, size, zlib: type == 3, lzvn: type == 7)
+        case 3, 7, 11: return try block(inline, size, zlib: type == 3, lzvn: type == 7)
         case 9: return inline.first == 0xcc ? inline.dropFirst() : inline
-        case 4, 8, 12, 10:
-            let r = try rsrcFork(inode)
-            if type == 10 { return r }
-            return try rsrcBlocks(r, size: size, zlib: type == 4, lzvn: type == 8)
+        case 10: return try resource()
+        case 8, 12: return try blocks(try resource(), size: size, lzvn: type == 8)
+        case 4: throw AXError.unsupported("files compressed with the old zlib resource-fork layout")
         default: throw AXError.unsupported("compressed file type \(type)")
         }
     }
 
-    /// LZVN / LZFSE data kept in the resource fork: a table of little-endian block offsets (count + 1 of them), then the
-    /// blocks, each decoding to 64 KB (the last one to the remainder).
-    private func rsrcBlocks(_ r: Data, size: Int, zlib: Bool, lzvn: Bool) throws -> Data {
-        if zlib { throw AXError.unsupported("files compressed with the old zlib resource-fork layout") }
+    /// LZVN / LZFSE data in the resource fork: a table of little-endian block offsets (count + 1 of them), then the blocks,
+    /// each decoding to 64 KB (the last one to the remainder).
+    private static func blocks(_ r: Data, size: Int, lzvn: Bool) throws -> Data {
         let rb = [UInt8](r)
         guard rb.count >= 8 else { throw AXError.corrupt("bad compressed file resource fork") }
         let firstBlock = l32(rb, 0)
@@ -319,16 +330,4 @@ final class ApfsVolume {
         guard out.count == size else { throw AXError.corrupt("compressed file has the wrong length") }
         return out
     }
-}
-
-private final class ApfsStream: ByteSource {
-    let v: ApfsVolume; let id: UInt64; let size: UInt64; var pos: UInt64 = 0
-    init(_ v: ApfsVolume, id: UInt64, size: UInt64) { self.v = v; self.id = id; self.size = size }
-    func read(_ n: Int) throws -> Data {
-        guard pos < size else { return Data() }
-        let d = try v.readExtents(id, at: pos, Int(min(UInt64(n), size - pos, 1 << 20)))
-        pos += UInt64(d.count)
-        return d
-    }
-    func skip(_ n: UInt64) throws { try discard(n) }
 }

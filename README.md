@@ -39,9 +39,9 @@
 
 | Format | Open · list · test · extract | Create | Add / delete files |
 |---|:---:|:---:|:---:|
-| **ZIP** — Deflate, Deflate64, bzip2, LZMA, store, ZIP64, AES-256, ZipCrypto, UTF-8 names, split sets (`.zip.001`) | ✅ | ✅ | ✅ |
-| **7z** — LZMA2, LZMA, PPMd, BZip2, Deflate, store, BCJ / BCJ2 / ARM / ARM64 / Delta filters, split sets (`.7z.001`), AES-256, encrypted file names, solid | ✅ | ✅ | ✅ |
-| **RAR 5** — all methods, solid, filters, AES-256, encrypted headers | ✅ | ❌ ¹ | ❌ |
+| **ZIP** — Deflate, Deflate64, bzip2, LZMA, store, ZIP64, AES-256, ZipCrypto, UTF-8 names, split sets (`.zip.001`, Info-ZIP `.z01`) | ✅ | ✅ | ✅ |
+| **7z** — LZMA2, LZMA, PPMd, BZip2, Deflate, store, BCJ / BCJ2 / ARM / ARM Thumb / ARM64 / PowerPC / SPARC / Itanium / Delta filters, split sets (`.7z.001`), AES-256, encrypted file names, solid | ✅ | ✅ | ✅ |
+| **RAR 5** — all methods, solid, filters, AES-256, encrypted headers, multi-volume sets | ✅ | ❌ ¹ | ❌ |
 | **RAR 3 / RAR 4** — LZ and PPMd text compression, all six filters, AES-128, encrypted file names, solid, multi-volume sets (`.part01.rar`, `.rar`/`.r00`) | ✅ | ❌ ¹ | ❌ |
 | **TAR** (ustar, pax, GNU) | ✅ | ✅ | ✅ |
 | **TAR.GZ · TAR.BZ2 · TAR.XZ** | ✅ | ✅ | — |
@@ -52,13 +52,13 @@
 | **DMG** disk images (zlib, bzip2, LZFSE, LZMA, raw; Apple/GPT/no partition map) with **HFS+** and **APFS** volumes (including transparently compressed files) | ✅ | — | — |
 | **PKG / XAR** (macOS installer packages) | ✅ | — | — |
 | **DEB · AR · RPM** (gzip / bzip2 / xz payloads) | ✅ | — | — |
-| **CAB** (stored, MSZIP) · **.Z** (compress) | ✅ | — | — |
+| **CAB** (stored, MSZIP) · **.Z** (compress) · **.lzma** | ✅ | — | — |
 
 ¹ RARLAB's license reserves the RAR compression algorithm, so ArchiveX can read RAR but will never create it.
 
-**Not supported (yet):** RAR 1.x / 2.x (pre-2000 archives), multi-volume RAR 5, encrypted APFS volumes, APFS snapshots,
-files compressed with the old zlib resource-fork layout, CAB files using LZX or Quantum, Zstandard data that needs a
-dictionary, WIM, ARJ, LZH, Info-ZIP style `.z01` spanned ZIPs, ZIP archives that use PPMd. ArchiveX tells you plainly when it meets one of these.
+**Not supported (yet):** RAR 1.x / 2.x (pre-2000 archives), encrypted APFS volumes, APFS snapshots, files compressed with
+the old zlib resource-fork layout, CAB files using LZX or Quantum, Zstandard data that needs a dictionary, WIM, ARJ, LZH,
+ZIP archives that use PPMd. ArchiveX tells you plainly when it meets one of these.
 
 ## Install
 
