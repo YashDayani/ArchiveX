@@ -45,6 +45,16 @@ swiftc -O -swift-version 5 $(ls Sources/*.swift | grep -v App.swift) Sources/Cor
 Headless checks of the window model: Quick Look previews never leak between archives, drag-out hands over a lazy file that is only extracted
 when the receiver asks for it, and the search filter. Needs only `/usr/bin/zip`.
 
+## Finder integration tests (`FinderActionsTests`)
+
+```bash
+swiftc -O -swift-version 5 $(ls Sources/*.swift | grep -v App.swift) Sources/Core/*.swift Tests/FinderActionsTests/main.swift -o /tmp/FinderActionsTests
+/tmp/FinderActionsTests <work-dir>
+```
+
+Runs the generated Quick Action workflow in macOS's own `automator` runner and checks the paths arrive; checks that `archivex://`
+links are only accepted from fresh list files in the temporary folder and that extraction asks first. Needs only `/usr/bin/zip`.
+
 ## App tests (`AppTests`)
 
 Drives the real `ArchiveModel` (open → list → test → extract → edit) for every creatable format. Needs a work

@@ -98,6 +98,14 @@ gh attestation verify ArchiveX.zip --repo YashDayani/ArchiveX
 
 Select files or folders first to extract only those. Encrypted archives ask for the password when needed.
 
+## Finder integration
+
+Right-click files in Finder → **Services** (or **Quick Actions**) → **Compress with ArchiveX**, **Extract with ArchiveX** or
+**Test with ArchiveX**. The Services entries work as soon as the app is in `/Applications` (run
+`/System/Library/CoreServices/pbs -flush` or log out and in if they do not appear). For the **Quick Actions** submenu, choose
+**ArchiveX → Install Finder Quick Actions…**; this copies three small workflows into `~/Library/Services`, and **Remove Finder
+Quick Actions** takes them out again. Extraction always asks first when it is started from a link.
+
 ## Compatibility
 
 - **macOS 13 Ventura or later**, including current releases. Only public SwiftUI / AppKit / system APIs are used.

@@ -181,3 +181,210 @@ struct PasswordSheet: View {
 
     private func submit() { guard !pw.isEmpty else { return }; model.submitPassword(pw) }
 }
+
+// MARK: - Archive Properties / Info (⌘I)
+
+struct InfoSheet: View {
+    let info: ArchiveInfo
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                Image(systemName: "archivebox.fill")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(info.name).font(.title3.weight(.semibold)).lineLimit(1)
+                    Text(info.formatName + " archive").font(.subheadline).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+                GridRow {
+                    Text("Location:").foregroundStyle(.secondary)
+                    Text(info.path).lineLimit(1).truncationMode(.middle)
+                }
+                GridRow {
+                    Text("Archive size:").foregroundStyle(.secondary)
+                    Text(Fmt.bytes(info.fileSize))
+                }
+                GridRow {
+                    Text("Contents:").foregroundStyle(.secondary)
+                    Text("\(info.fileCount) file\(info.fileCount == 1 ? "" : "s"), \(info.folderCount) folder\(info.folderCount == 1 ? "" : "s")")
+                }
+                GridRow {
+                    Text("Unpacked size:").foregroundStyle(.secondary)
+                    Text(Fmt.bytes(info.totalUncompressed))
+                }
+                GridRow {
+                    Text("Packed size:").foregroundStyle(.secondary)
+                    Text(Fmt.bytes(info.totalPacked))
+                }
+                GridRow {
+                    Text("Compression ratio:").foregroundStyle(.secondary)
+                    Text(info.compressionRatio)
+                }
+                GridRow {
+                    Text("Solid archive:").foregroundStyle(.secondary)
+                    Text(info.isSolid ? "Yes" : "No")
+                }
+                GridRow {
+                    Text("Encryption:").foregroundStyle(.secondary)
+                    Text(info.encryptionDetails)
+                }
+                if !info.details.isEmpty {
+                    GridRow {
+                        Text("Format details:").foregroundStyle(.secondary)
+                        Text(info.details)
+                    }
+                }
+            }
+            .font(.callout)
+
+            Divider()
+
+            HStack {
+                Button("Copy Path") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(info.path, forType: .string)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
+    }
+}
+
+// MARK: - Checksums & Hashes
+
+struct HashSheet: View {
+    let results: [ArchiveHasher.Result]
+    @Environment(\.dismiss) private var dismiss
+    @State private var verifyInput = ""
+    @State private var copiedAlgorithm: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: "number.square.fill")
+                    .font(.system(size: 26))
+                    .foregroundStyle(.tint)
+                Text(results.count == 1 ? "Checksums: \(results[0].name)" : "Checksums (\(results.count) files)")
+                    .font(.title3.weight(.semibold))
+                    .lineLimit(1)
+                Spacer()
+            }
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    ForEach(results) { r in
+                        VStack(alignment: .leading, spacing: 6) {
+                            if results.count > 1 {
+                                Text(r.name).font(.headline).lineLimit(1)
+                            }
+                            hashRow(title: "CRC32", value: r.crc32)
+                            hashRow(title: "MD5", value: r.md5)
+                            hashRow(title: "SHA-1", value: r.sha1)
+                            hashRow(title: "SHA-256", value: r.sha256)
+                        }
+                        .padding(10)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+                    }
+                }
+            }
+            .frame(maxHeight: 280)
+
+            Divider()
+
+            // Hash verification field
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Verify against expected hash:").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    TextField("Paste checksum here to verify…", text: $verifyInput)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                    if !verifyInput.isEmpty {
+                        Button { verifyInput = "" } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                if !verifyInput.trimmingCharacters(in: .whitespaces).isEmpty {
+                    verificationStatusView
+                }
+            }
+
+            HStack {
+                Button("Copy All") {
+                    var text = ""
+                    for r in results {
+                        text += "\(r.name) (\(Fmt.bytes(r.size)))\n"
+                        text += "CRC32:   \(r.crc32)\n"
+                        text += "MD5:     \(r.md5)\n"
+                        text += "SHA-1:   \(r.sha1)\n"
+                        text += "SHA-256: \(r.sha256)\n\n"
+                    }
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text.trimmingCharacters(in: .whitespacesAndNewlines), forType: .string)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+
+    private func hashRow(title: String, value: String) -> some View {
+        HStack {
+            Text(title).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).frame(width: 58, alignment: .leading)
+            Text(value).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            Spacer()
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(value, forType: .string)
+                copiedAlgorithm = title
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    if copiedAlgorithm == title { copiedAlgorithm = nil }
+                }
+            } label: {
+                Image(systemName: copiedAlgorithm == title ? "checkmark" : "doc.on.doc")
+                    .font(.caption)
+                    .foregroundStyle(copiedAlgorithm == title ? Color.green : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Copy \(title)")
+        }
+    }
+
+    private var verificationStatusView: some View {
+        let clean = verifyInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var match: (algo: String, file: String)? = nil
+        for r in results {
+            if r.crc32.lowercased() == clean { match = ("CRC32", r.name); break }
+            if r.md5.lowercased() == clean { match = ("MD5", r.name); break }
+            if r.sha1.lowercased() == clean { match = ("SHA-1", r.name); break }
+            if r.sha256.lowercased() == clean { match = ("SHA-256", r.name); break }
+        }
+        return HStack(spacing: 6) {
+            if let m = match {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                Text("Verified! Matches \(m.algo) of “\(m.file)”").font(.caption).foregroundStyle(.green)
+            } else {
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.orange)
+                Text("No match found for this hash").font(.caption).foregroundStyle(.orange)
+            }
+        }
+    }
+}

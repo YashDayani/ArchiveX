@@ -2,6 +2,24 @@ import SwiftUI
 import CryptoKit
 import UniformTypeIdentifiers
 import AppKit
+import Darwin
+
+struct ArchiveInfo: Identifiable {
+    let id = UUID()
+    var name: String
+    var path: String
+    var formatName: String
+    var fileSize: Int64
+    var fileCount: Int
+    var folderCount: Int
+    var totalUncompressed: Int64
+    var totalPacked: Int64
+    var compressionRatio: String
+    var isSolid: Bool
+    var isEncrypted: Bool
+    var encryptionDetails: String
+    var details: String
+}
 
 struct AlertInfo: Identifiable {
     let id = UUID()
@@ -65,6 +83,9 @@ final class ArchiveModel: ObservableObject {
     @Published var password: String?
     @Published var quickLookURL: URL?
     @Published var searchQuery = ""
+    @Published var hashResults: [ArchiveHasher.Result]?
+    @Published var archiveInfo: ArchiveInfo?
+    @Published var searchFieldFocused = false
 
     private var afterPassword: (() -> Void)?
     private var cancelWork: (() -> Void)?
@@ -110,18 +131,25 @@ final class ArchiveModel: ObservableObject {
     // MARK: derived
 
     var visibleRows: [Row] {
-        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let r: [Row]
         if q.isEmpty {
             r = rows(from: entries, in: currentDir)
         } else {
+            let qLower = q.lowercased()
+            let isWildcard = q.contains("*") || q.contains("?")
             let matched = entries.filter { e in
-                let name = (e.path as NSString).lastPathComponent.lowercased()
-                let full = e.path.lowercased()
-                if q.hasPrefix(".") {
-                    return name.hasSuffix(q) || full.hasSuffix(q)
+                let name = (e.path as NSString).lastPathComponent
+                let full = e.path
+                if isWildcard {
+                    return fnmatch(q, name, FNM_CASEFOLD) == 0 || fnmatch(q, full, FNM_CASEFOLD) == 0
                 }
-                return name.contains(q) || full.contains(q)
+                let nameLower = name.lowercased()
+                let fullLower = full.lowercased()
+                if qLower.hasPrefix(".") {
+                    return nameLower.hasSuffix(qLower) || fullLower.hasSuffix(qLower)
+                }
+                return nameLower.contains(qLower) || fullLower.contains(qLower)
             }
             r = matched.map { e in
                 Row(id: e.path, name: e.path, isDir: e.isDir, size: e.size, packed: e.packed,
@@ -260,7 +288,7 @@ final class ArchiveModel: ObservableObject {
 
     // MARK: scratch files (previews, drag-out, clipboard)
 
-    private static let scratchRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ArchiveX-Scratch")
+    nonisolated private static let scratchRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ArchiveX-Scratch")
     private static var scratchCleaned = false
 
     /// Removes preview / drag / clipboard files left over from earlier runs. Done once per launch, before any are created.
@@ -373,6 +401,101 @@ final class ArchiveModel: ObservableObject {
 
     func selectAll() {
         selection = Set(visibleRows.map(\.id))
+    }
+
+    func focusSearch() {
+        searchFieldFocused = true
+    }
+
+    func showArchiveInfo() {
+        guard let url = archiveURL else { return }
+        let fs = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+        let files = entries.filter { !$0.isDir }.count
+        let dirs = entries.filter { $0.isDir }.count
+        let unp = entries.reduce(Int64(0)) { $0 + ($1.isDir ? 0 : $1.size) }
+        let pck = packedTotal ?? entries.reduce(Int64(0)) { $0 + ($1.isDir ? 0 : $1.packed) }
+        let ratioStr: String
+        if unp > 0 {
+            let pct = max(0, min(100, Double(pck) / Double(unp) * 100))
+            let factor = Double(unp) / max(1, Double(pck))
+            ratioStr = String(format: "%.1f%% (%.1fx reduction)", pct, factor)
+        } else {
+            ratioStr = "—"
+        }
+        let isEnc = entries.contains { $0.encrypted }
+        let encStr: String
+        if !isEnc {
+            encStr = "None"
+        } else {
+            let ext = url.pathExtension.lowercased()
+            if ext == "rar" { encStr = "AES-256 (PBKDF2-HMAC-SHA256)" }
+            else if ext == "7z" { encStr = "AES-256 (SHA-256 KDF)" }
+            else { encStr = "AES-256 / ZipCrypto" }
+        }
+        let formatStr: String
+        if let f = ArchiveFormat.forExisting(url) {
+            formatStr = f.rawValue
+        } else {
+            formatStr = url.pathExtension.uppercased()
+        }
+
+        self.archiveInfo = ArchiveInfo(
+            name: url.lastPathComponent,
+            path: url.path,
+            formatName: formatStr,
+            fileSize: fs,
+            fileCount: files,
+            folderCount: dirs,
+            totalUncompressed: unp,
+            totalPacked: pck,
+            compressionRatio: ratioStr,
+            isSolid: packedPerFileUnknown,
+            isEncrypted: isEnc,
+            encryptionDetails: encStr,
+            details: details
+        )
+    }
+
+    func calculateHashes(for targetRows: [Row] = []) {
+        guard let url = archiveURL else { return }
+        let rowsToHash = targetRows.isEmpty ? selectedRows.filter { !$0.isDir } : targetRows.filter { !$0.isDir }
+        let pw = password
+
+        Task { [weak self] in
+            guard let self else { return }
+            if rowsToHash.isEmpty {
+                // Hash the archive container file itself
+                switch await self.run("Calculating checksums of “\(url.lastPathComponent)”…", { p in
+                    try ArchiveHasher.hash(file: url, displayName: url.lastPathComponent, progress: p)
+                }) {
+                case .success(let r):
+                    self.hashResults = [r]
+                case .failure(let e):
+                    self.handle(e, title: "Checksum calculation failed") { [weak self] in self?.calculateHashes() }
+                }
+            } else {
+                // Hash the selected entries
+                let cacheDir = Self.newScratch("Hash")
+                defer { try? FileManager.default.removeItem(at: cacheDir) }
+
+                var results: [ArchiveHasher.Result] = []
+                for (i, row) in rowsToHash.enumerated() {
+                    let label = rowsToHash.count > 1 ? "Hashing \(i + 1) of \(rowsToHash.count)…" : "Hashing “\(row.name)”…"
+                    let res = await self.run(label, { p in
+                        try AXCore.extract(url, selection: [(path: row.id, isDir: false)], to: cacheDir, overwrite: .all, keepPaths: true, password: pw, progress: p)
+                        let extracted = cacheDir.appendingPathComponent(row.id)
+                        return try ArchiveHasher.hash(file: extracted, displayName: row.name)
+                    })
+                    switch res {
+                    case .success(let h): results.append(h)
+                    case .failure(let e):
+                        self.handle(e, title: "Hashing failed") { }
+                        return
+                    }
+                }
+                self.hashResults = results
+            }
+        }
     }
 
     // MARK: test / delete

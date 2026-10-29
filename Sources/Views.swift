@@ -37,6 +37,7 @@ struct ContentView: View {
         .onAppear {
             ArchiveModel.cleanOldScratch()
             KeyEvents.install(model)
+            FinderActions.shared.attach(model)
         }
         .alert(item: $model.alert) { info in
             if let title = info.actionTitle, let action = info.action {
@@ -49,6 +50,10 @@ struct ContentView: View {
         .sheet(item: $model.addDraft) { AddSheet(draft: $0) }
         .sheet(item: $model.extractDraft) { ExtractSheet(draft: $0) }
         .sheet(isPresented: $model.passwordPrompt) { PasswordSheet() }
+        .sheet(item: $model.archiveInfo) { InfoSheet(info: $0) }
+        .sheet(isPresented: Binding(get: { model.hashResults != nil }, set: { if !$0 { model.hashResults = nil } })) {
+            if let results = model.hashResults { HashSheet(results: results) }
+        }
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -86,6 +91,8 @@ struct ButtonBar: View {
             BarButton("Add", "plus.rectangle.on.folder", enabled: model.hasArchive) { Panels.addToOpen(model) }
             BarButton("Extract To", "arrow.down.doc", enabled: model.hasArchive) { model.prepareExtract() }
             BarButton("Test", "checkmark.shield", enabled: model.hasArchive) { model.test() }
+            BarButton("Info", "info.circle", enabled: model.hasArchive) { model.showArchiveInfo() }
+            BarButton("Hashes", "number.square", enabled: model.hasArchive) { model.calculateHashes() }
             BarButton("Quick Look", "eye.circle", enabled: model.selectedRows.contains { !$0.isDir }) {
                 model.quickLookSelected()
             }
@@ -129,6 +136,7 @@ struct BarButton: View {
 
 struct PathBar: View {
     @EnvironmentObject var model: ArchiveModel
+    @FocusState private var isSearchFocused: Bool
 
     var body: some View {
         HStack(spacing: 8) {
@@ -153,10 +161,17 @@ struct PathBar: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                TextField("Search archive…", text: $model.searchQuery)
+                TextField("Search (⌘F)…", text: $model.searchQuery)
                     .textFieldStyle(.plain)
                     .font(.system(size: 11))
                     .frame(width: 120)
+                    .focused($isSearchFocused)
+                    .onChange(of: model.searchFieldFocused) { focused in
+                        if focused {
+                            isSearchFocused = true
+                            model.searchFieldFocused = false
+                        }
+                    }
                 if !model.searchQuery.isEmpty {
                     Button { model.searchQuery = "" } label: {
                         Image(systemName: "xmark.circle.fill")
@@ -223,6 +238,8 @@ struct FileTable: View {
                     Button("View") { model.view(r) }
                     Divider()
                 }
+                Button("Calculate Checksums…") { model.calculateHashes() }
+                Button("Get Info (⌘I)") { model.showArchiveInfo() }
                 Button("Copy (⌘C)") { model.copySelection() }
                 Button("Extract Selected To…") { model.prepareExtract() }
                 Divider()

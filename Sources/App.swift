@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 
 @main
 struct ArchiveXApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = ArchiveModel()
 
     var body: some Scene {
@@ -10,7 +11,9 @@ struct ArchiveXApp: App {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 760, minHeight: 460)
-                .onOpenURL { model.open($0) }
+                .onOpenURL { url in
+                    if url.scheme == "archivex" { FinderActions.shared.handle(link: url) } else { model.open(url) }
+                }
         }
         .defaultSize(width: 980, height: 600)
         .commands { MenuCommands(model: model) }
@@ -28,7 +31,33 @@ struct MenuCommands: Commands {
             Button("Close Archive") { model.close() }
                 .keyboardShortcut("w").disabled(!model.hasArchive)
         }
+        CommandGroup(replacing: .pasteboard) {
+            Button("Find in Archive…") { model.focusSearch() }.keyboardShortcut("f")
+            Button("Select All") { model.selectAll() }.keyboardShortcut("a").disabled(!model.hasArchive)
+            Button("Copy") { model.copySelection() }.keyboardShortcut("c").disabled(model.selection.isEmpty)
+        }
+        CommandGroup(after: .appInfo) {
+            if FinderActions.quickActionsInstalled {
+                Button("Remove Finder Quick Actions") {
+                    FinderActions.removeQuickActions()
+                    model.alert = AlertInfo(title: "Quick Actions removed", message: "“Compress / Extract / Test with ArchiveX” are gone from Finder’s Quick Actions menu.")
+                }
+            } else {
+                Button("Install Finder Quick Actions…") {
+                    do {
+                        try FinderActions.installQuickActions()
+                        model.alert = AlertInfo(title: "Quick Actions installed",
+                                                message: "Right-click files in Finder → Quick Actions → Compress / Extract / Test with ArchiveX. If they do not show up yet, open System Settings → Privacy & Security → Extensions → Finder and make sure they are ticked.")
+                    } catch { model.alert = AlertInfo(title: "Couldn’t install Quick Actions", message: error.localizedDescription) }
+                }
+            }
+        }
         CommandMenu("Commands") {
+            Button("Get Info") { model.showArchiveInfo() }
+                .keyboardShortcut("i").disabled(!model.hasArchive)
+            Button("Calculate Checksums…") { model.calculateHashes() }
+                .keyboardShortcut("k", modifiers: [.command, .shift]).disabled(!model.hasArchive)
+            Divider()
             Button("Quick Look (Space)") { model.quickLookSelected() }
                 .disabled(model.selection.isEmpty)
             Button("View") {

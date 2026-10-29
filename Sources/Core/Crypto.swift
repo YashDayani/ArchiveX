@@ -107,3 +107,54 @@ struct ZipCrypto {
         return out
     }
 }
+
+// MARK: - Streaming Multi-Hash Tool (CRC32, MD5, SHA-1, SHA-256)
+
+struct ArchiveHasher {
+    private var crc: UInt32 = 0
+    private var md5 = Insecure.MD5()
+    private var sha1 = Insecure.SHA1()
+    private var sha256 = SHA256()
+    private(set) var bytesProcessed: Int64 = 0
+
+    mutating func update(_ data: Data) {
+        crc = CRC32.update(crc, data)
+        md5.update(data: data)
+        sha1.update(data: data)
+        sha256.update(data: data)
+        bytesProcessed += Int64(data.count)
+    }
+
+    struct Result: Identifiable {
+        var id: String { name }
+        var name: String
+        var size: Int64
+        var crc32: String
+        var md5: String
+        var sha1: String
+        var sha256: String
+    }
+
+    func finalize(name: String) -> Result {
+        let md5Hex = md5.finalize().map { String(format: "%02x", $0) }.joined()
+        let sha1Hex = sha1.finalize().map { String(format: "%02x", $0) }.joined()
+        let sha256Hex = sha256.finalize().map { String(format: "%02x", $0) }.joined()
+        let crcHex = String(format: "%08X", crc)
+        return Result(name: name, size: bytesProcessed, crc32: crcHex, md5: md5Hex, sha1: sha1Hex, sha256: sha256Hex)
+    }
+
+    static func hash(file url: URL, displayName: String? = nil, progress: (@Sendable (Double) -> Void)? = nil) throws -> Result {
+        let f = try FileIn(url)
+        var h = ArchiveHasher()
+        var off: UInt64 = 0
+        while off < f.size {
+            try Task.checkCancellation()
+            let chunk = try f.read(at: off, 1 << 20)
+            if chunk.isEmpty { break }
+            h.update(chunk)
+            off += UInt64(chunk.count)
+            if f.size > 0 { progress?(Double(off) / Double(f.size)) }
+        }
+        return h.finalize(name: displayName ?? url.lastPathComponent)
+    }
+}
