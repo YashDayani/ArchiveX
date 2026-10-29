@@ -574,6 +574,35 @@ do {
             try AXCore.test(a, password: pw ? aesPW : nil, progress: { _ in })
         } catch { check("7z PPMd [\(label)]", false, "\(error)") }
     }
+    // the other branch filters (PowerPC, SPARC, ARM Thumb, Itanium, 32-bit ARM), in 7z and in xz, on data that triggers them
+    let bdir = work.appendingPathComponent("bcjdata"); try fm.createDirectory(at: bdir, withIntermediateDirectories: true)
+    var pattern = Data()
+    for i in 0..<60_000 {                // words that look like each architecture's call instructions, mixed with noise
+        pattern.append(contentsOf: [0x48, UInt8(i & 255), UInt8((i >> 8) & 255), 0x01])                              // PPC bl
+        pattern.append(contentsOf: [0x40, UInt8(i & 0x3f), UInt8((i * 7) & 255), UInt8((i * 3) & 255)])             // SPARC call
+        pattern.append(contentsOf: [UInt8(i & 255), 0xf0 | UInt8(i & 7), UInt8((i * 5) & 255), 0xf8 | UInt8((i >> 3) & 7)])  // Thumb bl
+        pattern.append(contentsOf: [UInt8(i & 255), UInt8((i >> 8) & 255), UInt8((i * 3) & 255), 0xeb])             // ARM bl
+        pattern.append(contentsOf: [UInt8.random(in: 0...255), UInt8.random(in: 0...255), UInt8.random(in: 0...255), UInt8.random(in: 0...255)])
+    }
+    for k in 0..<2000 { pattern.append(contentsOf: [0x10 | UInt8(k & 7) | 0x04, 0, 0, 0, 0, 0xa0, 0x03, 0x14, 0x01, 0x40, 0x02, 0, 0, 0, 0, 0]) }  // IA64-ish bundles
+    try pattern.write(to: bdir.appendingPathComponent("code.bin"))
+    for f in ["PPC", "SPARC", "ARMT", "ARM", "IA64"] {
+        let a = foreign7.appendingPathComponent("bcj-\(f).7z")
+        sh("\(SZ) a -bso0 -t7z -mf=\(f) \(q(a)) code.bin", cwd: bdir)
+        let info = sh("\(SZ) l -slt \(q(a)) | grep -i '^Method' | head -1").out
+        let ref = ref7z(a, "bcj-\(f)")
+        do {
+            let ours = try extractOurs(a, to: "x7bcj-\(f)")
+            check("7z \(f) filter: matches 7-Zip's extraction", sameTree(ref, ours) == nil, sameTree(ref, ours) ?? "")
+            check("7z \(f) filter: archive really uses it", info.uppercased().contains(f), info)
+        } catch { check("7z \(f) filter", false, "\(error)") }
+        let x = foreign7.appendingPathComponent("bcj-\(f).xz")
+        sh("\(SZ) a -bso0 -txz -mf=\(f) \(q(x)) code.bin", cwd: bdir)
+        do {
+            let ours = try extractOurs(x, to: "xzbcj-\(f)")
+            check("xz \(f) filter: round trip", (try? Data(contentsOf: ours.appendingPathComponent("bcj-\(f)"))) == pattern)
+        } catch { check("xz \(f) filter", false, "\(error)") }
+    }
     // BCJ2 (four-stream x86 filter) on real x86-64 code, and a split archive (name.7z.001, …)
     let xdir = work.appendingPathComponent("x86dir"); try fm.createDirectory(at: xdir, withIntermediateDirectories: true)
     var haveX86 = false

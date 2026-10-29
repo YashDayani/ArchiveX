@@ -95,7 +95,11 @@ final class XzSource: ByteSource {
     private func makeFilter(_ id: UInt64, _ props: Data) throws -> StreamFilter {
         switch id {
         case 0x04: return BCJx86()
+        case 0x05: return BCJPPC()
+        case 0x06: return BCJIA64()
         case 0x07: return BCJARM()
+        case 0x08: return BCJARMT()
+        case 0x09: return BCJSPARC()
         case 0x0a: return BCJARM64()
         case 0x03: return DeltaFilter(distance: Int(props.first ?? 0) + 1)
         default: throw AXError.unsupported("xz filter \(String(id, radix: 16))")

@@ -15,13 +15,15 @@ private enum ID {
 private enum Method {
     static let copy: UInt64 = 0x00, delta: UInt64 = 0x03, bcjx86: UInt64 = 0x04, arm64: UInt64 = 0x0a
     static let lzma2: UInt64 = 0x21, lzma: UInt64 = 0x030101, ppmd: UInt64 = 0x030401
+    static let ppc: UInt64 = 0x05, ia64: UInt64 = 0x06, arm: UInt64 = 0x07, armt: UInt64 = 0x08, sparc: UInt64 = 0x09
+    static let ppcOld: UInt64 = 0x03030205, ia64Old: UInt64 = 0x03030401, armtOld: UInt64 = 0x03030701, sparcOld: UInt64 = 0x03030805
     static let bcj2: UInt64 = 0x0303011b, bcjx86Old: UInt64 = 0x03030103, armOld: UInt64 = 0x03030501
     static let deflate: UInt64 = 0x040108, bzip2: UInt64 = 0x040202, aes: UInt64 = 0x06f10701
 
     static func name(_ id: UInt64) -> String {
         switch id {
         case copy: return "Store"; case bcj2: return "BCJ2"; case delta: return "Delta"; case bcjx86, bcjx86Old: return "BCJ"; case arm64: return "ARM64"
-        case armOld: return "ARM"; case lzma2: return "LZMA2"; case lzma: return "LZMA"; case ppmd: return "PPMd"
+        case armOld, arm: return "ARM"; case ppc, ppcOld: return "PPC"; case ia64, ia64Old: return "IA64"; case armt, armtOld: return "ARMT"; case sparc, sparcOld: return "SPARC"; case lzma2: return "LZMA2"; case lzma: return "LZMA"; case ppmd: return "PPMd"
         case deflate: return "Deflate"; case bzip2: return "BZip2"; case aes: return "AES-256"
         default: return "method " + String(id, radix: 16)
         }
@@ -564,7 +566,11 @@ final class SevenZipArchive {
             case Method.deflate: return InflateSource(input: input)
             case Method.bcjx86, Method.bcjx86Old: return FilterSource(input: input, filter: BCJx86())
             case Method.arm64: return FilterSource(input: input, filter: BCJARM64())
-            case Method.armOld: return FilterSource(input: input, filter: BCJARM())
+            case Method.armOld, Method.arm: return FilterSource(input: input, filter: BCJARM())
+            case Method.ppc, Method.ppcOld: return FilterSource(input: input, filter: BCJPPC())
+            case Method.ia64, Method.ia64Old: return FilterSource(input: input, filter: BCJIA64())
+            case Method.armt, Method.armtOld: return FilterSource(input: input, filter: BCJARMT())
+            case Method.sparc, Method.sparcOld: return FilterSource(input: input, filter: BCJSPARC())
             case Method.delta: return FilterSource(input: input, filter: DeltaFilter(distance: Int(c.props.first ?? 0) + 1))
             case Method.aes: return try SevenAESSource(input: input, props: c.props, password: password, unpackSize: size)
             default: throw AXError.unsupported("7z compression method “\(Method.name(c.id))”")

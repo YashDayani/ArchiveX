@@ -111,6 +111,106 @@ final class BCJARM64: StreamFilter {
     }
 }
 
+/// PowerPC (big-endian) branch converter.
+final class BCJPPC: StreamFilter {
+    func process(_ buf: inout [UInt8], count: Int, nowPos: UInt64, decode: Bool, final: Bool) -> Int {
+        var i = 0
+        while i + 4 <= count {
+            if buf[i] >> 2 == 0x12 && buf[i + 3] & 3 == 1 {
+                let src = UInt32(buf[i] & 3) << 24 | UInt32(buf[i + 1]) << 16 | UInt32(buf[i + 2]) << 8 | UInt32(buf[i + 3] & ~3)
+                let pc = UInt32(truncatingIfNeeded: nowPos) &+ UInt32(i)
+                let dest = decode ? src &- pc : src &+ pc
+                buf[i] = 0x48 | UInt8(truncatingIfNeeded: (dest >> 24) & 3)
+                buf[i + 1] = UInt8(truncatingIfNeeded: dest >> 16)
+                buf[i + 2] = UInt8(truncatingIfNeeded: dest >> 8)
+                buf[i + 3] = (buf[i + 3] & 3) | UInt8(truncatingIfNeeded: dest & ~3)
+            }
+            i += 4
+        }
+        return final ? count : i
+    }
+}
+
+/// SPARC call converter.
+final class BCJSPARC: StreamFilter {
+    func process(_ buf: inout [UInt8], count: Int, nowPos: UInt64, decode: Bool, final: Bool) -> Int {
+        var i = 0
+        while i + 4 <= count {
+            if (buf[i] == 0x40 && buf[i + 1] & 0xc0 == 0) || (buf[i] == 0x7f && buf[i + 1] & 0xc0 == 0xc0) {
+                var src = UInt32(buf[i]) << 24 | UInt32(buf[i + 1]) << 16 | UInt32(buf[i + 2]) << 8 | UInt32(buf[i + 3])
+                src <<= 2
+                let pc = UInt32(truncatingIfNeeded: nowPos) &+ UInt32(i)
+                var dest = decode ? src &- pc : src &+ pc
+                dest >>= 2
+                dest = (((0 &- ((dest >> 22) & 1)) << 22) & 0x3fff_ffff) | (dest & 0x3f_ffff) | 0x4000_0000
+                buf[i] = UInt8(truncatingIfNeeded: dest >> 24); buf[i + 1] = UInt8(truncatingIfNeeded: dest >> 16)
+                buf[i + 2] = UInt8(truncatingIfNeeded: dest >> 8); buf[i + 3] = UInt8(truncatingIfNeeded: dest)
+            }
+            i += 4
+        }
+        return final ? count : i
+    }
+}
+
+/// ARM Thumb branch-with-link converter.
+final class BCJARMT: StreamFilter {
+    func process(_ buf: inout [UInt8], count: Int, nowPos: UInt64, decode: Bool, final: Bool) -> Int {
+        var i = 0
+        while i + 4 <= count {
+            if buf[i + 1] & 0xf8 == 0xf0 && buf[i + 3] & 0xf8 == 0xf8 {
+                var src = (UInt32(buf[i + 1] & 7) << 19) | (UInt32(buf[i]) << 11) | (UInt32(buf[i + 3] & 7) << 8) | UInt32(buf[i + 2])
+                src <<= 1
+                let pc = UInt32(truncatingIfNeeded: nowPos) &+ UInt32(i) &+ 4
+                var dest = decode ? src &- pc : src &+ pc
+                dest >>= 1
+                buf[i + 1] = 0xf0 | UInt8(truncatingIfNeeded: (dest >> 19) & 7)
+                buf[i] = UInt8(truncatingIfNeeded: dest >> 11)
+                buf[i + 3] = 0xf8 | UInt8(truncatingIfNeeded: (dest >> 8) & 7)
+                buf[i + 2] = UInt8(truncatingIfNeeded: dest)
+                i += 2
+            }
+            i += 2
+        }
+        return final ? count : i
+    }
+}
+
+/// Itanium branch converter.
+final class BCJIA64: StreamFilter {
+    private static let table: [UInt32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 6, 6, 0, 0, 7, 7, 4, 4, 0, 0, 4, 4, 0, 0]
+    func process(_ buf: inout [UInt8], count: Int, nowPos: UInt64, decode: Bool, final: Bool) -> Int {
+        var i = 0
+        while i + 16 <= count {
+            let mask = BCJIA64.table[Int(buf[i] & 0x1f)]
+            var bitPos = 5
+            for slot in 0..<3 {
+                defer { bitPos += 41 }
+                if (mask >> UInt32(slot)) & 1 == 0 { continue }
+                let bytePos = bitPos >> 3, bitRes = UInt64(bitPos & 7)
+                var instruction: UInt64 = 0
+                for j in 0..<6 { instruction |= UInt64(buf[i + j + bytePos]) << UInt64(8 * j) }
+                var norm = instruction >> bitRes
+                if (norm >> 37) & 0xf == 0x5 && (norm >> 9) & 0x7 == 0 {
+                    var src = UInt32(truncatingIfNeeded: (norm >> 13) & 0xf_ffff)
+                    src |= UInt32(truncatingIfNeeded: (norm >> 36) & 1) << 20
+                    src <<= 4
+                    let pc = UInt32(truncatingIfNeeded: nowPos) &+ UInt32(i)
+                    var dest = decode ? src &- pc : src &+ pc
+                    dest >>= 4
+                    norm &= ~(UInt64(0x8f_ffff) << 13)
+                    norm |= UInt64(dest & 0xf_ffff) << 13
+                    norm |= UInt64(dest & 0x10_0000) << (36 - 20)
+                    instruction &= (UInt64(1) << bitRes) - 1
+                    instruction |= norm << bitRes
+                    for j in 0..<6 { buf[i + j + bytePos] = UInt8(truncatingIfNeeded: instruction >> UInt64(8 * j)) }
+                }
+            }
+            i += 16
+        }
+        return final ? count : i
+    }
+}
+
 final class DeltaFilter: StreamFilter {
     private let dist: Int
     private var history = [UInt8](repeating: 0, count: 256)
