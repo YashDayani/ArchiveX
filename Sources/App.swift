@@ -21,6 +21,7 @@ struct ArchiveXApp: App {
 }
 
 struct MenuCommands: Commands {
+    @AppStorage(Updater.autoCheckKey) private var autoCheckUpdates = true
     @ObservedObject var model: ArchiveModel
 
     var body: some Commands {
@@ -37,6 +38,9 @@ struct MenuCommands: Commands {
             Button("Copy") { model.copySelection() }.keyboardShortcut("c").disabled(model.selection.isEmpty)
         }
         CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") { Updater.shared.checkNow() }
+            Toggle("Check for Updates Automatically", isOn: $autoCheckUpdates)
+            Divider()
             if FinderActions.quickActionsInstalled {
                 Button("Remove Finder Quick Actions") {
                     FinderActions.removeQuickActions()

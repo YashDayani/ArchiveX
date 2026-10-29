@@ -388,3 +388,60 @@ struct HashSheet: View {
         }
     }
 }
+
+// MARK: - Software update
+
+struct UpdateSheet: View {
+    @ObservedObject private var updater = Updater.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            switch updater.state {
+            case .idle, .checking:
+                HStack(spacing: 10) { ProgressView().controlSize(.small); Text("Checking for updates…") }
+                buttons { Button("Cancel") { updater.dismiss() }.keyboardShortcut(.cancelAction) }
+            case .upToDate:
+                Text("ArchiveX is up to date").font(.title3.weight(.semibold))
+                Text("You have the latest version (\(updater.currentVersion)).").foregroundStyle(.secondary)
+                buttons { Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
+            case .available(let offer):
+                Text("ArchiveX \(offer.version) is available").font(.title3.weight(.semibold))
+                Text("You have \(updater.currentVersion). Download size: \(ByteCountFormatter.string(fromByteCount: offer.size, countStyle: .file)).")
+                    .foregroundStyle(.secondary)
+                ScrollView {
+                    Text(Self.notes(offer.notes)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                }
+                .frame(height: 170).padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
+                buttons {
+                    Button("Release Page") { NSWorkspace.shared.open(offer.pageURL) }
+                    Spacer()
+                    Button("Skip This Version") { updater.skip(offer) }
+                    Button("Later") { updater.dismiss() }.keyboardShortcut(.cancelAction)
+                    Button("Install Update") { updater.install(offer) }.keyboardShortcut(.defaultAction)
+                }
+            case .working(let text, let fraction):
+                Text("Updating ArchiveX").font(.title3.weight(.semibold))
+                if let fraction { ProgressView(value: fraction) } else { ProgressView().progressViewStyle(.linear) }
+                Text(text).foregroundStyle(.secondary).font(.callout)
+            case .failed(let message):
+                Label("Couldn’t update", systemImage: "exclamationmark.triangle").font(.title3.weight(.semibold))
+                Text(message).fixedSize(horizontal: false, vertical: true)
+                buttons { Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
+            case .revealed:
+                Text("The new version is ready").font(.title3.weight(.semibold))
+                Text("ArchiveX can’t replace itself where it is installed, so the new app is shown in Finder. Quit ArchiveX and drag the new app over the old one (for example into Applications).")
+                    .fixedSize(horizontal: false, vertical: true)
+                buttons { Button("OK") { updater.dismiss() }.keyboardShortcut(.defaultAction) }
+            }
+        }
+        .padding(20).frame(width: 460)
+    }
+
+    private func buttons<C: View>(@ViewBuilder _ content: () -> C) -> some View { HStack { content() }.padding(.top, 4) }
+
+    private static func notes(_ markdown: String) -> AttributedString {
+        let text = markdown.isEmpty ? "No release notes." : markdown
+        return (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(text)
+    }
+}

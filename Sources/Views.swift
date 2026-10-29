@@ -3,6 +3,7 @@ import QuickLook
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    @ObservedObject private var updater = Updater.shared
     @EnvironmentObject var model: ArchiveModel
     @State private var dropTargeted = false
 
@@ -38,6 +39,7 @@ struct ContentView: View {
             ArchiveModel.cleanOldScratch()
             KeyEvents.install(model)
             FinderActions.shared.attach(model)
+            Updater.shared.checkOnLaunch()
         }
         .alert(item: $model.alert) { info in
             if let title = info.actionTitle, let action = info.action {
@@ -51,6 +53,7 @@ struct ContentView: View {
         .sheet(item: $model.extractDraft) { ExtractSheet(draft: $0) }
         .sheet(isPresented: $model.passwordPrompt) { PasswordSheet() }
         .sheet(item: $model.archiveInfo) { InfoSheet(info: $0) }
+        .sheet(isPresented: $updater.sheetVisible) { UpdateSheet() }
         .sheet(isPresented: Binding(get: { model.hashResults != nil }, set: { if !$0 { model.hashResults = nil } })) {
             if let results = model.hashResults { HashSheet(results: results) }
         }

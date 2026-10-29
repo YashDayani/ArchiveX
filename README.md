@@ -106,6 +106,15 @@ Right-click files in Finder → **Services** (or **Quick Actions**) → **Compre
 **ArchiveX → Install Finder Quick Actions…**; this copies three small workflows into `~/Library/Services`, and **Remove Finder
 Quick Actions** takes them out again. Extraction always asks first when it is started from a link.
 
+## Updates
+
+**ArchiveX → Check for Updates…** looks at this repository's latest GitHub release. ArchiveX also checks quietly once a day at start-up
+(switch it off with **Check for Updates Automatically**); nothing but the request to GitHub is sent. If a newer version exists you see
+its release notes and can **Install Update**, **Skip This Version** or go to the release page. The download is only used when it comes
+from GitHub over HTTPS, matches the SHA-256 in the release's `SHA256SUMS`, is ArchiveX (same bundle identifier), is newer than the
+running version and has a valid code signature. ArchiveX then restarts into the new version. If it cannot replace itself where it is
+installed, it shows the new app in Finder for you to drag over the old one.
+
 ## Compatibility
 
 - **macOS 13 Ventura or later**, including current releases. Only public SwiftUI / AppKit / system APIs are used.

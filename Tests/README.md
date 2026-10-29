@@ -55,6 +55,17 @@ swiftc -O -swift-version 5 $(ls Sources/*.swift | grep -v App.swift) Sources/Cor
 Runs the generated Quick Action workflow in macOS's own `automator` runner and checks the paths arrive; checks that `archivex://`
 links are only accepted from fresh list files in the temporary folder and that extraction asks first. Needs only `/usr/bin/zip`.
 
+## Updater tests (`UpdaterTests`)
+
+```bash
+swiftc -O -swift-version 5 $(ls Sources/*.swift | grep -v App.swift) Sources/Core/*.swift Tests/UpdaterTests/main.swift -o /tmp/UpdaterTests
+/tmp/UpdaterTests <work-dir>
+```
+
+Version ordering, release parsing, the `SHA256SUMS` reader, the GitHub-only download rule, and complete update runs against local files:
+a good update reaches the installer; a tampered zip, another app, a version that is not newer, a missing checksum file and a non-GitHub
+location are all refused. Needs `ditto` and `codesign` (part of macOS).
+
 ## App tests (`AppTests`)
 
 Drives the real `ArchiveModel` (open → list → test → extract → edit) for every creatable format. Needs a work
