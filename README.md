@@ -124,6 +124,14 @@ open build/ArchiveX.app
 
 Run the tests (needs the oracle tools above installed locally — see [`Tests/README.md`](Tests/README.md)).
 
+## Releasing (maintainers)
+
+Releases are built, attested and published by GitHub Actions. Open **Actions → Release → Run workflow**, type a version
+such as `1.2.0` and approve the run. The workflow checks that CI passed for the latest `main` commit, signs the tag with
+a dedicated CI signing key, builds the universal app, writes `SHA256SUMS`, attaches a build-provenance attestation and
+publishes the release. One-time setup (the `release` environment and its signing-key secrets) is described at the top of
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
+
 ## How it works
 
 ```

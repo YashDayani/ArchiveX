@@ -1,10 +1,24 @@
 name: Release
 
-# Builds ArchiveX from source when a version tag is pushed, then publishes a GitHub release with the zipped app,
-# SHA-256 checksums and a build-provenance attestation (so anyone can verify the zip came from this repository).
+# Builds ArchiveX from source and publishes a GitHub release with the zipped app, SHA-256 checksums and a
+# build-provenance attestation (so anyone can verify the zip came from this repository).
 #
-# If the repository has an Apple Developer ID configured (the secrets listed below), the app is also signed with it and
-# notarized by Apple, so macOS opens it without a warning. Without those secrets the app is ad-hoc signed.
+# Two ways to start it:
+#   1. Actions tab → Release → "Run workflow", type a version such as 1.2.0. The workflow checks that CI passed for the
+#      commit, waits for your approval (the "release" environment), signs the tag v1.2.0 with the CI signing key,
+#      pushes it, then builds and publishes. No terminal needed.
+#   2. Push a tag yourself (git tag v1.2.0 && git push origin v1.2.0): the build and publish steps run on that tag.
+#
+# One-time setup (Settings → Environments → New environment "release"):
+#   • Required reviewers: add yourself, so every release needs your click on "Approve".
+#   • Environment secret RELEASE_SIGNING_KEY: the PRIVATE half of a dedicated, passphrase-less ed25519 key
+#       ssh-keygen -t ed25519 -N "" -C "ArchiveX CI signing" -f ci_signing
+#   • Environment secret RELEASE_SIGNING_PUBKEY: the matching ci_signing.pub (one line)
+#   • Add ci_signing.pub to your GitHub account as a *signing* key so the tag shows "Verified":
+#       gh ssh-key add ci_signing.pub --type signing --title "ArchiveX CI signing"
+#
+# Optional: if the repository has an Apple Developer ID configured (the secrets below), the app is also signed with it
+# and notarized by Apple, so macOS opens it without a warning. Without them the app is ad-hoc signed.
 #   MACOS_CERTIFICATE_P12       base64 of the "Developer ID Application" certificate exported as .p12
 #   MACOS_CERTIFICATE_PASSWORD  password of that .p12
 #   MACOS_SIGN_IDENTITY         e.g. "Developer ID Application: Your Name (TEAMID)"
@@ -12,21 +26,99 @@ name: Release
 #   APPLE_APP_PASSWORD          an app-specific password for that Apple ID
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (for example 1.2.0)"
+        required: true
+        type: string
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write        # create the release
+  contents: write        # create the tag and the release
   id-token: write        # sign the attestation
   attestations: write    # store the attestation
+  actions: read          # read the CI result for the commit
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
+  tag:
+    name: Create and sign the tag
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release           # pauses for approval and provides the signing secrets
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Check the version
+        id: meta
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "Version must look like 1.2.0 (got: $VERSION)"; exit 1
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Make sure the tag is new and CI passed for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then echo "Tag $TAG already exists"; exit 1; fi
+          sha="$(git rev-parse HEAD)"
+          echo "Releasing $TAG from $sha"
+          result="$(gh run list --workflow ci.yml --commit "$sha" --json conclusion --jq '.[0].conclusion')"
+          if [ "$result" != "success" ]; then
+            echo "CI has not passed for $sha (result: '${result:-none}'). Wait for it to finish, then run this again."; exit 1
+          fi
+
+      - name: Sign and push the tag
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          SIGNING_PUBKEY: ${{ secrets.RELEASE_SIGNING_PUBKEY }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if [ -z "$SIGNING_KEY" ] || [ -z "$SIGNING_PUBKEY" ]; then
+            echo "Missing RELEASE_SIGNING_KEY / RELEASE_SIGNING_PUBKEY in the 'release' environment (see the top of this file)."; exit 1
+          fi
+          umask 077
+          mkdir -p "$RUNNER_TEMP/sign"
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/sign/key"
+          printf '%s\n' "$SIGNING_PUBKEY" > "$RUNNER_TEMP/sign/key.pub"
+          printf '* %s\n' "$(cat "$RUNNER_TEMP/sign/key.pub")" > "$RUNNER_TEMP/sign/allowed"
+          git config user.name "ArchiveX release workflow"
+          git config user.email "52958495+${GITHUB_REPOSITORY_OWNER}@users.noreply.github.com"
+          git config gpg.format ssh
+          git config user.signingkey "$RUNNER_TEMP/sign/key"
+          git config gpg.ssh.allowedSignersFile "$RUNNER_TEMP/sign/allowed"
+          git tag -s "$TAG" -m "ArchiveX ${TAG#v}"
+          git tag -v "$TAG"
+          git push origin "refs/tags/$TAG"
+          rm -rf "$RUNNER_TEMP/sign"
+
   build:
+    name: Build and publish
+    needs: [tag]
+    # run for a pushed tag, or after the tag job succeeded
+    if: ${{ !cancelled() && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
     runs-on: macos-latest
     env:
+      TAG: ${{ needs.tag.outputs.tag || github.ref_name }}
       HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.tag.outputs.tag || github.ref_name }}
 
       - name: Show toolchain
         run: |
@@ -52,10 +144,9 @@ jobs:
 
       - name: Build universal app
         env:
-          VERSION_TAG: ${{ github.ref_name }}
           ARCHIVEX_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
-          ARCHIVEX_VERSION="${VERSION_TAG#v}" ./build.sh
+          ARCHIVEX_VERSION="${TAG#v}" ./build.sh
           lipo -archs build/ArchiveX.app/Contents/MacOS/ArchiveX
 
       - name: Notarize with Apple
@@ -84,7 +175,6 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
         run: |
           gh release create "$TAG" ArchiveX.zip SHA256SUMS \
-            --title "ArchiveX $TAG" --generate-notes
+            --title "ArchiveX $TAG" --generate-notes --verify-tag
