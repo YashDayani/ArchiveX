@@ -132,6 +132,12 @@ running version, has a valid code signature and, when your copy is signed with a
 itself and restarts into the new version, leaving nothing behind. If it cannot replace itself where it is installed, it shows the new
 app in Finder for you to drag over the old one.
 
+## Reporting a problem
+
+**Help → Report a Bug…** opens a new issue on this repository's [Issues](../../issues) page with your ArchiveX version, macOS version and
+Mac type already filled in (**Request a Feature…** does the same for ideas). Nothing about your files is sent; you see the whole form in
+your browser and nothing is posted until you press *Submit*.
+
 ## Compatibility
 
 - **macOS 13 Ventura or later**, including current releases. Only public SwiftUI / AppKit / system APIs are used.

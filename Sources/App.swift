@@ -43,6 +43,13 @@ struct MenuCommands: Commands {
             Button("Select All") { model.selectAll() }.keyboardShortcut("a").disabled(!model.hasArchive)
             Button("Copy") { model.copySelection() }.keyboardShortcut("c").disabled(model.selection.isEmpty)
         }
+        CommandGroup(replacing: .help) {
+            Button("Report a Bug…") { Feedback.open(.bug) }
+            Button("Request a Feature…") { Feedback.open(.feature) }
+            Divider()
+            Button("ArchiveX on GitHub") { NSWorkspace.shared.open(Feedback.repoPage) }
+            Button("Known Issues") { NSWorkspace.shared.open(Feedback.issuesPage) }
+        }
         CommandGroup(after: .appInfo) {
             Button("Check for Updates…") { Updater.shared.checkNow() }
             Toggle("Check for Updates Automatically", isOn: $autoCheckUpdates)

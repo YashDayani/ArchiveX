@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest something ArchiveX should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like ArchiveX to do?
+      description: Describe the problem you're trying to solve, not only the feature.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: How would it help you?
+  - type: input
+    id: version
+    attributes:
+      label: ArchiveX version
+      description: Filled in for you when you send this from the app (Help → Request a Feature…).

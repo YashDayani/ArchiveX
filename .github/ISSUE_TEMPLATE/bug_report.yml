@@ -1,0 +1,61 @@
+name: Bug report
+description: Something in ArchiveX isn't working as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. Please don't attach archives that contain private files; a description or a small sample that shows the problem is enough.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, and what did ArchiveX do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open an archive…
+        2. Click…
+        3. See the problem
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+  - type: dropdown
+    id: format
+    attributes:
+      label: Archive format involved
+      options:
+        - Not about a specific archive
+        - ZIP
+        - 7z
+        - RAR
+        - TAR / TGZ / TBZ2 / TXZ
+        - ISO / DMG / other disc image
+        - Split archive (.001, .002 …)
+        - Other
+  - type: input
+    id: version
+    attributes:
+      label: ArchiveX version
+      description: Filled in for you when you report from the app (Help → Report a Bug…).
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+  - type: input
+    id: chip
+    attributes:
+      label: Mac
+      description: Apple Silicon or Intel
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots or anything else
+      description: Drag an image in here, or paste any error message you saw.

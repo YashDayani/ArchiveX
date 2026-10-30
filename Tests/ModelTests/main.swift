@@ -101,6 +101,17 @@ func check(_ n: String, _ ok: Bool, _ note: String = "") { if ok { pass += 1; pr
     for k in [Prefs.defaultLevelKey, Prefs.defaultFormatKey, Prefs.overwriteKey, Prefs.revealKey] { ud.removeObject(forKey: k) }
     check("without preferences the built-in defaults apply", Prefs.defaultLevel == nil && Prefs.defaultFormat == nil && Prefs.overwrite == .all && Prefs.reveal)
 
+    // 3f. Help → Report a Bug…
+    let bug = Feedback.url(.bug, version: "1.4.1", macOS: "macOS 15.1", chip: "Apple Silicon (arm64)")
+    let q = Dictionary(uniqueKeysWithValues: (URLComponents(url: bug, resolvingAgainstBaseURL: false)?.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+    check("the bug report opens a new issue on the project's GitHub page", bug.host == "github.com" && bug.path == "/YashDayani/ArchiveX/issues/new", bug.absoluteString)
+    check("the bug report form is prefilled with version, macOS and chip",
+          q["template"] == "bug_report.yml" && q["version"] == "1.4.1" && q["macos"] == "macOS 15.1" && q["chip"] == "Apple Silicon (arm64)", "\(q)")
+    check("the feature request uses its own form", Feedback.url(.feature).absoluteString.contains("template=feature_request.yml"))
+    check("nothing about the user's files or home folder is sent", !Feedback.url(.bug).absoluteString.contains(NSHomeDirectory()) && !Feedback.url(.bug).absoluteString.contains(NSUserName()))
+    let tpl = (try? String(contentsOfFile: "\(fm.currentDirectoryPath)/.github/ISSUE_TEMPLATE/bug_report.yml")) ?? ""
+    if !tpl.isEmpty { check("every prefilled field exists in the issue form", ["id: version", "id: macos", "id: chip"].allSatisfy { tpl.contains($0) }) }
+
     // 4. leftovers: only the scratch root, which is wiped at the next launch
     ArchiveModel.cleanOldScratch()
     print("\nRESULT: \(pass) passed, \(fail) failed")
