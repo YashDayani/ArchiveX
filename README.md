@@ -107,8 +107,12 @@ gh attestation verify ArchiveX.zip --repo YashDayani/ArchiveX
 | **Test** integrity | <kbd>⌘</kbd><kbd>T</kbd> |
 | **Add** to the open archive | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>A</kbd> |
 | **View** one file | Double-click it — it is extracted to a temporary folder and opened |
+| **Move around** | <kbd>Return</kbd> or <kbd>⌘</kbd><kbd>↓</kbd> opens a folder or file · <kbd>⌘</kbd><kbd>↑</kbd> goes up · type a few letters to jump to a name · <kbd>Esc</kbd> clears the search |
+| **Delete** from the archive | <kbd>⌘</kbd><kbd>⌫</kbd> (or <kbd>⌫</kbd>) |
+| **Settings** | <kbd>⌘</kbd><kbd>,</kbd> — default format and level, what to do with existing files, notifications, update checks |
 
-Select files or folders first to extract only those. Encrypted archives ask for the password when needed.
+Select files or folders first to extract only those. Encrypted archives ask for the password when needed. Long jobs show the time
+remaining, put a percentage on the Dock icon, and notify you when they finish while you are in another app.
 
 ## Finder integration
 

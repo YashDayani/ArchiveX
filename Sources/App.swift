@@ -17,6 +17,7 @@ struct ArchiveXApp: App {
         }
         .defaultSize(width: 980, height: 600)
         .commands { MenuCommands(model: model) }
+        Settings { SettingsView() }
     }
 }
 
@@ -62,6 +63,11 @@ struct MenuCommands: Commands {
             }
         }
         CommandMenu("Commands") {
+            Button("Enclosing Folder") { model.goUp() }
+                .keyboardShortcut(.upArrow, modifiers: .command).disabled(model.currentDir.isEmpty || !model.searchQuery.isEmpty)
+            Button("Open Selected") { model.openSelected() }
+                .keyboardShortcut(.downArrow, modifiers: .command).disabled(model.selectedRows.count != 1)
+            Divider()
             Button("Get Info") { model.showArchiveInfo() }
                 .keyboardShortcut("i").disabled(!model.hasArchive)
             Button("Calculate Checksums…") { model.calculateHashes() }
@@ -86,7 +92,7 @@ struct MenuCommands: Commands {
             Button("Test Archive") { model.test() }
                 .keyboardShortcut("t").disabled(!model.hasArchive)
             Button("Delete Selected from Archive (Delete)") { model.confirmDelete() }
-                .disabled(model.selection.isEmpty)
+                .keyboardShortcut(.delete, modifiers: .command).disabled(model.selection.isEmpty)
         }
     }
 }

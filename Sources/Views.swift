@@ -132,6 +132,7 @@ struct BarButton: View {
         .opacity(enabled ? 1 : 0.35)
         .onHover { hover = $0 }
         .help(title)
+        .accessibilityLabel(title)
     }
 }
 
@@ -144,7 +145,8 @@ struct PathBar: View {
     var body: some View {
         HStack(spacing: 8) {
             Button { model.goUp() } label: { Image(systemName: "arrow.turn.left.up") }
-                .disabled(model.currentDir.isEmpty || !model.searchQuery.isEmpty).help("Up one level")
+                .disabled(model.currentDir.isEmpty || !model.searchQuery.isEmpty).help("Up one level (⌘↑)")
+                .accessibilityLabel("Up one level")
             Image(systemName: "doc.zipper").foregroundStyle(.secondary)
             Text(model.archiveURL?.lastPathComponent ?? "")
                 .fontWeight(.medium)
@@ -182,6 +184,7 @@ struct PathBar: View {
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Clear search")
                 }
             }
             .padding(.horizontal, 6)
@@ -214,8 +217,9 @@ struct FileTable: View {
                 HStack(spacing: 6) {
                     Image(nsImage: Icons.icon(for: r)).resizable().frame(width: 18, height: 18)
                     Text(r.name).lineLimit(1)
-                    if r.encrypted { Image(systemName: "lock.fill").font(.caption2).foregroundStyle(.secondary) }
+                    if r.encrypted { Image(systemName: "lock.fill").font(.caption2).foregroundStyle(.secondary).accessibilityLabel("Encrypted") }
                 }
+                .accessibilityElement(children: .combine)
                 .contentShape(Rectangle())
                 .onDrag { model.fileProvider(for: r) }
             }.width(min: 180, ideal: 300)
@@ -369,14 +373,19 @@ struct BusyOverlay: View {
             VStack(spacing: 12) {
                 Text(model.busyLabel).font(.headline)
                 if let p = model.progress {
-                    ProgressView(value: p).frame(width: 260)
-                    Text("\(Int(p * 100))%").font(.caption).foregroundStyle(.secondary)
+                    ProgressView(value: p).frame(width: 280)
+                        .accessibilityLabel(model.busyLabel).accessibilityValue("\(Int(p * 100)) percent")
+                    Text("\(Int(p * 100))%").font(.callout.monospacedDigit())
                 } else {
-                    ProgressView().controlSize(.large)
+                    ProgressView().controlSize(.large).accessibilityLabel(model.busyLabel)
                 }
-                Button("Cancel") { model.cancel() }
+                if let detail = model.progressDetail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+                Button("Cancel") { model.cancel() }.keyboardShortcut(.cancelAction)
             }
             .padding(24)
+            .frame(minWidth: 320)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             .shadow(radius: 12)
         }
@@ -444,14 +453,20 @@ enum KeyEvents {
     static func install(_ model: ArchiveModel) {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+            guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
                   let w = NSApp.keyWindow, !(w is NSPanel), w.attachedSheet == nil,
                   !(w.firstResponder is NSTextView), !(w.firstResponder is NSTextField),
-                  model.hasArchive, !model.selection.isEmpty else { return event }
+                  model.hasArchive, !model.busy else { return event }
             switch event.keyCode {
-            case 49: model.quickLookSelected(); return nil                     // space
-            case 51, 117: model.confirmDelete(); return nil                    // delete, forward delete
-            default: return event
+            case 49 where !model.selection.isEmpty: model.quickLookSelected(); return nil      // space
+            case 51, 117 where !model.selection.isEmpty: model.confirmDelete(); return nil     // delete, forward delete
+            case 36, 76 where !model.selection.isEmpty: model.openSelected(); return nil       // return, enter
+            case 53 where !model.searchQuery.isEmpty: model.searchQuery = ""; return nil       // escape clears the search
+            default:
+                // type-to-select: plain letters and digits jump to the matching name
+                if let c = event.charactersIgnoringModifiers, c.count == 1, c.first!.isLetter || c.first!.isNumber,
+                   model.typeahead(c) { return nil }
+                return event
             }
         }
     }

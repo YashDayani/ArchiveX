@@ -76,9 +76,9 @@ struct ExtractDraft: Identifiable {
     let id = UUID()
     var destination: String
     var onlySelected: Bool
-    var overwrite = Overwrite.all
+    var overwrite = Prefs.overwrite
     var keepPaths = true
-    var openAfter = true
+    var openAfter = Prefs.reveal
     var hasSelection: Bool
 
     enum Overwrite: String, CaseIterable, Identifiable {
@@ -102,6 +102,7 @@ final class ArchiveModel: ObservableObject {
     @Published var busy = false
     @Published var busyLabel = ""
     @Published var progress: Double?
+    @Published var progressDetail: String?
     @Published var alert: AlertInfo?
     @Published var addDraft: AddDraft?
     @Published var extractDraft: ExtractDraft?
@@ -122,16 +123,31 @@ final class ArchiveModel: ObservableObject {
     /// Runs one of the blocking jobs of ArchiveX Core off the main thread, with progress and cancel.
     private func run<T: Sendable>(_ label: String,
                                   _ work: @escaping @Sendable (@escaping @Sendable (Double) -> Void) throws -> T) async -> Result<T, Error> {
-        busy = true; busyLabel = label; progress = nil
+        busy = true; busyLabel = label; progress = nil; progressDetail = nil
+        let started = Date()
         let onProgress: @Sendable (Double) -> Void = { [weak self] p in
-            Task { @MainActor [weak self] in self?.progress = p }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.progress = p
+                let elapsed = Date().timeIntervalSince(started)
+                let left = JobTime.remaining(elapsed: elapsed, fraction: p).map(JobTime.text(remaining:))
+                self.progressDetail = [left, "Elapsed \(JobTime.elapsed(elapsed))"].compactMap { $0 }.joined(separator: " · ")
+                JobNotifier.dock(p)
+            }
         }
         let task = Task.detached(priority: .userInitiated) { () throws -> T in
             try work(onProgress)
         }
         cancelWork = { task.cancel() }
         let result = await task.result
-        cancelWork = nil; busy = false; progress = nil
+        cancelWork = nil; busy = false; progress = nil; progressDetail = nil
+        let what = label.trimmingCharacters(in: CharacterSet(charactersIn: ". …"))
+        switch result {
+        case .success: JobNotifier.finished("\(what) finished.", afterSeconds: Date().timeIntervalSince(started))
+        case .failure(let e):
+            if e is CancellationError { JobNotifier.dock(nil) }
+            else { JobNotifier.finished("\(what) didn’t finish. Open ArchiveX to see why.", afterSeconds: Date().timeIntervalSince(started)) }
+        }
         return result
     }
 
@@ -150,7 +166,7 @@ final class ArchiveModel: ObservableObject {
             afterPassword = retry; passwordPrompt = true
             return
         }
-        alert = AlertInfo(title: title, message: error.localizedDescription)
+        alert = AlertInfo(title: title, message: FriendlyError.describe(error))
     }
 
     private var selectionPairs: [(path: String, isDir: Bool)] { selectedRows.map { (path: $0.id, isDir: $0.isDir) } }
@@ -250,6 +266,25 @@ final class ArchiveModel: ObservableObject {
 
     func enter(_ row: Row) {
         if row.isDir { currentDir = row.id; selection = [] } else { view(row) }
+    }
+
+    /// Return / ⌘↓: opens the selected folder, or views the selected file.
+    func openSelected() {
+        guard selectedRows.count == 1, let r = selectedRows.first else { return }
+        enter(r)
+    }
+
+    private var typeBuffer = "", typeStamp = Date.distantPast
+
+    /// Typing letters jumps to the first row whose name starts with them (the buffer resets after a second).
+    @discardableResult func typeahead(_ chars: String) -> Bool {
+        let now = Date()
+        typeBuffer = now.timeIntervalSince(typeStamp) > 1 ? chars.lowercased() : typeBuffer + chars.lowercased()
+        typeStamp = now
+        let rows = visibleRows.sorted { ($0.isDir ? 0 : 1, $0.name.lowercased()) < ($1.isDir ? 0 : 1, $1.name.lowercased()) }
+        guard let hit = rows.first(where: { $0.name.lowercased().hasPrefix(typeBuffer) }) else { return false }
+        selection = [hit.id]
+        return true
     }
 
     // MARK: extract
@@ -571,7 +606,8 @@ final class ArchiveModel: ObservableObject {
 
     /// Opens the "Archive name and parameters" dialog. `toOpenArchive` adds into the archive on screen.
     func prepareAdd(files: [URL], toOpenArchive: Bool = false) {
-        var format = UserDefaults.standard.string(forKey: "lastFormat").flatMap(ArchiveFormat.init(rawValue:)) ?? .sevenZ
+        var format = Prefs.defaultFormat
+            ?? UserDefaults.standard.string(forKey: "lastFormat").flatMap(ArchiveFormat.init(rawValue:)) ?? .sevenZ
         let suggestion: String
         if toOpenArchive, let existing = archiveURL {
             guard let f = ArchiveFormat.forExisting(existing), f.canUpdate else {
@@ -590,6 +626,7 @@ final class ArchiveModel: ObservableObject {
         }
         var d = AddDraft(files: files, archivePath: suggestion)
         d.format = format
+        if let level = Prefs.defaultLevel { d.level = level }
         d.updatingExisting = FileManager.default.fileExists(atPath: suggestion)
         addDraft = d
     }

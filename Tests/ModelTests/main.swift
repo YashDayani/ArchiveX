@@ -70,6 +70,37 @@ func check(_ n: String, _ ok: Bool, _ note: String = "") { if ok { pass += 1; pr
     check("search with no match is empty", m.visibleRows.isEmpty)
     m.searchQuery = ""
 
+    // 3b. type-to-select
+    m.selection = []
+    check("typing b selects big.bin", m.typeahead("b") && m.selection == ["big.bin"], "\(m.selection)")
+    check("a letter that matches nothing does not move the selection", !m.typeahead("z") && m.selection == ["big.bin"], "\(m.selection)")
+    try? await Task.sleep(nanoseconds: 1_100_000_000)
+    check("after a pause typing starts a new word", m.typeahead("r") && m.selection == ["readme.txt"], "\(m.selection)")
+
+    // 3c. time remaining
+    check("no estimate before enough progress", JobTime.remaining(elapsed: 1, fraction: 0.5) == nil && JobTime.remaining(elapsed: 10, fraction: 0.01) == nil)
+    check("estimate from elapsed time and progress", JobTime.remaining(elapsed: 30, fraction: 0.25) == 90)
+    check("estimate wording", JobTime.text(remaining: 4) == "A few seconds left" && JobTime.text(remaining: 42) == "About 40 seconds left"
+          && JobTime.text(remaining: 90) == "About 2 minutes left" && JobTime.text(remaining: 60) == "About 1 minute left", "\(JobTime.text(remaining: 90))")
+    check("elapsed wording", JobTime.elapsed(9) == "9 s" && JobTime.elapsed(125) == "2:05")
+
+    // 3d. plain-language errors
+    check("an early end of file explains the likely cause", FriendlyError.describe(AXError.corrupt("unexpected end of file")).contains("incomplete download"))
+    check("a wrong password says what to do", FriendlyError.describe(AXError.wrongPassword).contains("case-sensitive"))
+    check("a full disk is explained", FriendlyError.describe(NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)).contains("free space"))
+    check("a missing permission is explained", FriendlyError.describe(NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))).contains("isn’t allowed"))
+    check("an unknown error keeps its own text", FriendlyError.describe(NSError(domain: "x", code: 1, userInfo: [NSLocalizedDescriptionKey: "Boom"])) == "Boom")
+
+    // 3e. preferences feed the defaults
+    let ud = UserDefaults.standard
+    ud.set(5, forKey: Prefs.defaultLevelKey); ud.set("ZIP", forKey: Prefs.defaultFormatKey)
+    ud.set(ExtractDraft.Overwrite.skip.rawValue, forKey: Prefs.overwriteKey); ud.set(false, forKey: Prefs.revealKey)
+    check("default level and format preferences are read", Prefs.defaultLevel == 5 && Prefs.defaultFormat?.rawValue == "ZIP", "\(String(describing: Prefs.defaultFormat))")
+    let ed = ExtractDraft(destination: "/tmp/x", onlySelected: false, hasSelection: false)
+    check("extract defaults follow the preferences", ed.overwrite == .skip && ed.openAfter == false)
+    for k in [Prefs.defaultLevelKey, Prefs.defaultFormatKey, Prefs.overwriteKey, Prefs.revealKey] { ud.removeObject(forKey: k) }
+    check("without preferences the built-in defaults apply", Prefs.defaultLevel == nil && Prefs.defaultFormat == nil && Prefs.overwrite == .all && Prefs.reveal)
+
     // 4. leftovers: only the scratch root, which is wiped at the next launch
     ArchiveModel.cleanOldScratch()
     print("\nRESULT: \(pass) passed, \(fail) failed")
