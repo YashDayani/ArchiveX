@@ -131,6 +131,7 @@ final class Updater: ObservableObject {
     var defaults = UserDefaults.standard
     var checkSigner: (URL) -> SignerTrust = Updater.signerTrust
     var relaunch: (_ script: URL, _ newApp: URL) -> Bool = Updater.launchHelper
+    var quit: () -> Void = { NSApplication.shared.terminate(nil) }
 
     // MARK: Checking
 
@@ -253,8 +254,18 @@ final class Updater: ObservableObject {
         state = .working("Installing — ArchiveX will restart…", nil)
         let script = work.appendingPathComponent("swap.sh")
         try Self.helperScript.write(to: script, atomically: true, encoding: .utf8)
-        if relaunch(script, newApp) { NSApp.terminate(nil) }
+        if relaunch(script, newApp) { await quitForInstall() }
         else { throw UpdateError.message("Could not start the installer. The new version is in \(newApp.deletingLastPathComponent().path).") }
+    }
+
+    /// The installer is waiting for us to exit. A quit request is not always honoured while the update sheet is attached to the
+    /// window, so close the sheet first and exit outright if the request is still pending a moment later.
+    private func quitForInstall() async {
+        sheetVisible = false
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        quit()
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        exit(0)
     }
 
     private func download(_ url: URL, to dest: URL) async throws {
@@ -349,7 +360,14 @@ final class Updater: ObservableObject {
     static let helperScript = """
     #!/bin/sh
     pid="$1"; app="$2"; new="$3"; work="$4"
-    while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+    # Wait for ArchiveX to quit. If it has not after ~10 s (a quit request can be declined), end it: SIGTERM first, SIGKILL later.
+    grace="${ARCHIVEX_GRACE:-50}"; n=0
+    while kill -0 "$pid" 2>/dev/null; do
+      n=$((n+1))
+      [ "$n" -eq "$grace" ] && kill "$pid" 2>/dev/null
+      [ "$n" -eq "$((grace+25))" ] && kill -9 "$pid" 2>/dev/null
+      sleep 0.2
+    done
     old="$app.old-$$"
     mv "$app" "$old" || { open "$app"; exit 1; }
     if ditto "$new" "$app"; then

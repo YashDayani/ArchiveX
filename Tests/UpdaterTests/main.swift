@@ -183,6 +183,35 @@ func makeRelease(version: String, bundleID: String = "io.feedspace.archivex", in
     await upd.check(manual: true)
     if case .available = upd.state { check("a manual check still offers it", true) } else { check("a manual check still offers it", false, "\(upd.state)") }
 
+    // 7b. the installer must not wait forever for an app that does not quit
+    func runHelper(victim: Process) -> (swapped: Bool, victimGone: Bool, secs: Double) {
+        let root = work.appendingPathComponent("helper-\(UUID().uuidString)")
+        let bin = root.appendingPathComponent("bin"), apps = root.appendingPathComponent("Apps"), w = root.appendingPathComponent("work")
+        let newApp = w.appendingPathComponent("unpacked/ArchiveX.app")
+        for d in [bin, apps.appendingPathComponent("ArchiveX.app/Contents"), newApp.appendingPathComponent("Contents")] { try! fm.createDirectory(at: d, withIntermediateDirectories: true) }
+        try! "old".write(to: apps.appendingPathComponent("ArchiveX.app/Contents/v"), atomically: true, encoding: .utf8)
+        try! "new".write(to: newApp.appendingPathComponent("Contents/v"), atomically: true, encoding: .utf8)
+        try! "#!/bin/sh\nexit 0\n".write(to: bin.appendingPathComponent("open"), atomically: true, encoding: .utf8)
+        sh("/bin/chmod", ["+x", bin.appendingPathComponent("open").path])
+        let script = w.appendingPathComponent("swap.sh")
+        try! Updater.helperScript.write(to: script, atomically: true, encoding: .utf8)
+        try! victim.run()
+        let t0 = Date()
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = [script.path, String(victim.processIdentifier), apps.appendingPathComponent("ArchiveX.app").path, newApp.path, w.path]
+        p.environment = ["PATH": bin.path + ":/usr/bin:/bin", "ARCHIVEX_GRACE": "5"]
+        try! p.run(); p.waitUntilExit()
+        let installed = (try? String(contentsOf: apps.appendingPathComponent("ArchiveX.app/Contents/v"))) ?? ""
+        return (installed == "new" && !fm.fileExists(atPath: w.path), !victim.isRunning, Date().timeIntervalSince(t0))
+    }
+    let polite = Process(); polite.executableURL = URL(fileURLWithPath: "/bin/sleep"); polite.arguments = ["300"]
+    let r1 = runHelper(victim: polite)
+    check("an app that stays running is ended after the grace period and the update still installs", r1.swapped && r1.victimGone && r1.secs < 8, "\(r1)")
+    let stubborn = Process(); stubborn.executableURL = URL(fileURLWithPath: "/bin/sh")
+    stubborn.arguments = ["-c", "trap '' TERM; while true; do sleep 1; done"]
+    let r2 = runHelper(victim: stubborn)
+    check("an app that ignores the first request is force-ended", r2.swapped && r2.victimGone && r2.secs < 12, "\(r2)")
+
     // 8. release notes shown in the sheet
     let gh = """
     ## What's Changed
