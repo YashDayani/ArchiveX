@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 
 // Checks for the updater: version ordering, release parsing, the checksum list, the GitHub-only download rule, and a full
@@ -81,6 +82,7 @@ func makeRelease(version: String, bundleID: String = "io.feedspace.archivex", in
     let upd = Updater()
     upd.isTrustedDownload = { _ in true }
     upd.checkSigner = { _ in .matches }
+    upd.publicKey = nil                 // the checks below predate signing; signed updates are tested in 6h
     upd.defaults = UserDefaults(suiteName: "archivex-updater-test-\(UUID().uuidString)")!
     upd.currentVersion = "1.0.0"
     upd.appURL = work.appendingPathComponent("Installed/ArchiveX.app")
@@ -174,6 +176,51 @@ func makeRelease(version: String, bundleID: String = "io.feedspace.archivex", in
     off.defaults.set(false, forKey: Updater.autoCheckKey); off.currentVersion = "1.0.0"; off.releaseURL = feed
     off.checkOnLaunch(); try? await Task.sleep(nanoseconds: 500_000_000)
     check("the launch check respects the off switch", off.state == .idle)
+
+    // 6h. signed updates: only a zip signed with the app's key is installed, even when the checksum list was forged to match it
+    let signer = Curve25519.Signing.PrivateKey(), stranger = Curve25519.Signing.PrivateKey()
+    func signature(of zip: URL, by key: Curve25519.Signing.PrivateKey, to name: String) -> URL {
+        let out = zip.deletingLastPathComponent().appendingPathComponent(name)
+        try! key.signature(for: try! Data(contentsOf: zip)).base64EncodedString().write(to: out, atomically: true, encoding: .utf8)
+        return out
+    }
+    func attempt(_ o: UpdateOffer) async -> String {
+        handedOff = nil
+        upd.state = .idle; upd.install(o)
+        for _ in 0..<200 { if case .failed = upd.state { break }; if handedOff != nil { break }; try? await Task.sleep(nanoseconds: 50_000_000) }
+        if handedOff != nil { return "installed" }          // the stand-in installer declines on purpose, so reaching it is success
+        if case .failed(let m) = upd.state { return m }
+        return "\(upd.state)"
+    }
+    upd.currentVersion = "1.0.0"; upd.checkSigner = { _ in .matches }; upd.isTrustedDownload = { _ in true }
+    upd.publicKey = signer.publicKey.rawRepresentation
+    let sdir = work.appendingPathComponent("signed"); try! fm.createDirectory(at: sdir, withIntermediateDirectories: true)
+    let sr = makeRelease(version: "1.1.0", in: sdir)
+    let goodSig = signature(of: sr.zip, by: signer, to: "good.sig")
+    func signedOffer(zip: URL, sums: URL, sig: URL?) -> UpdateOffer { UpdateOffer(version: "1.1.0", notes: "", pageURL: local.pageURL, zipURL: zip, sumsURL: sums, size: 1, sigURL: sig) }
+    check("a zip signed with the app's key is installed", await attempt(signedOffer(zip: sr.zip, sums: sr.sums, sig: goodSig)) == "installed")
+
+    // an attacker who controls the release swaps the zip AND rewrites SHA256SUMS to match it
+    let evil = sdir.appendingPathComponent("evil.zip"); try! fm.copyItem(at: sr.zip, to: evil)
+    let fh2 = try! FileHandle(forWritingTo: evil); try! fh2.seekToEnd(); try! fh2.write(contentsOf: Data([9, 9, 9])); try! fh2.close()
+    let evilSums = sdir.appendingPathComponent("evil-sums"); try! "\(try! ArchiveHasher.hash(file: evil).sha256)  ArchiveX.zip\n".write(to: evilSums, atomically: true, encoding: .utf8)
+    let forged = await attempt(signedOffer(zip: evil, sums: evilSums, sig: goodSig))
+    check("a forged zip with a matching checksum list is refused", forged.contains("signature is not valid"), forged)
+    let strangerSig = signature(of: sr.zip, by: stranger, to: "stranger.sig")
+    let byStranger = await attempt(signedOffer(zip: sr.zip, sums: sr.sums, sig: strangerSig))
+    check("a zip signed with someone else's key is refused", byStranger.contains("signature is not valid"), byStranger)
+    let junk = sdir.appendingPathComponent("junk.sig"); try! "not a signature".write(to: junk, atomically: true, encoding: .utf8)
+    let junked = await attempt(signedOffer(zip: sr.zip, sums: sr.sums, sig: junk))
+    check("a garbage signature file is refused", junked.contains("signature is not valid"), junked)
+    let unsigned = await attempt(signedOffer(zip: sr.zip, sums: sr.sums, sig: nil))
+    check("a release without a signature is not installed", unsigned.contains("isn’t signed"), unsigned)
+    upd.publicKey = nil
+    check("before signing is set up the checksum alone still decides", await attempt(signedOffer(zip: sr.zip, sums: sr.sums, sig: nil)) == "installed")
+    check("a signature of the wrong length is refused", !Updater.verifySignature(zip: sr.zip, signatureBase64: "AAAA", publicKey: signer.publicKey.rawRepresentation))
+    check("a valid signature verifies", Updater.verifySignature(zip: sr.zip, signatureBase64: try! String(contentsOf: goodSig), publicKey: signer.publicKey.rawRepresentation))
+    let withSig = parsed(json(assets: [("ArchiveX.zip", "https://github.com/a/b/z"), ("SHA256SUMS", "https://github.com/a/b/s"), ("ArchiveX.zip.sig", "https://github.com/a/b/g")]))
+    check("the signature file is found in a release", withSig?.sigURL?.lastPathComponent == "g" && parsed(json())?.sigURL == nil)
+    upd.checkSigner = { _ in .matches }
 
     // 7. skipping a version silences quiet checks only
     upd.currentVersion = "1.0.0"; upd.releaseURL = feed; upd.state = .idle

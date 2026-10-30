@@ -127,7 +127,8 @@ Quick Actions** takes them out again. Extraction always asks first when it is st
 **ArchiveX → Check for Updates…** looks at this repository's latest GitHub release. ArchiveX also checks quietly every time it starts
 (switch it off with **Check for Updates Automatically**); nothing but the request to GitHub is sent. If a newer version exists you see
 its release notes and can **Install Update**, **Skip This Version** or go to the release page. The download is only used when it comes
-from GitHub over HTTPS, matches the SHA-256 in the release's `SHA256SUMS`, is ArchiveX (same bundle identifier), is newer than the
+from GitHub over HTTPS, matches the SHA-256 in the release's `SHA256SUMS`, is signed with the ArchiveX update key (Ed25519, checked against
+a public key built into the app, so even someone who could edit the release page cannot ship a fake update), is ArchiveX (same bundle identifier), is newer than the
 running version, has a valid code signature and, when your copy is signed with a developer certificate, carries the same signer. ArchiveX then replaces
 itself and restarts into the new version, leaving nothing behind. If it cannot replace itself where it is installed, it shows the new
 app in Finder for you to drag over the old one.
@@ -171,6 +172,13 @@ such as `1.2.0` and approve the run. The workflow checks that CI passed for the 
 a dedicated CI signing key, builds the universal app, writes `SHA256SUMS`, attaches a build-provenance attestation and
 publishes the release. One-time setup (the `release` environment and its signing-key secrets) is described at the top of
 [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+**Signed updates (one-time, required).** The release zip is also signed with an Ed25519 key and published as `ArchiveX.zip.sig`;
+the app only installs updates that verify against the public key in [`Sources/UpdateKey.swift`](Sources/UpdateKey.swift). Run
+`scripts/setup-update-signing.sh` once: it makes the key pair, stores the private half as the repository secret `UPDATE_SIGNING_KEY`
+and writes the public half into that file, which you then commit. It offers the private key once so you can keep a backup. If that
+key is lost, installed copies stop accepting updates until people reinstall a build with a new key, so keep the backup safe. A
+release stops before publishing while signing is not set up.
 
 ## How it works
 

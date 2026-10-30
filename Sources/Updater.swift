@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import Security
 
@@ -17,6 +18,7 @@ struct UpdateOffer: Equatable {
     var zipURL: URL
     var sumsURL: URL?
     var size: Int64
+    var sigURL: URL? = nil
 }
 
 /// A dotted version such as 1.2.0 or v1.3-beta.1. A pre-release sorts before the release it leads up to.
@@ -117,7 +119,7 @@ final class Updater: ObservableObject {
 
     static let shared = Updater()
     static let autoCheckKey = "autoCheckUpdates", skippedKey = "skippedUpdateVersion"
-    static let assetName = "ArchiveX.zip", sumsName = "SHA256SUMS"
+    static let assetName = "ArchiveX.zip", sumsName = "SHA256SUMS", sigName = "ArchiveX.zip.sig"
 
     @Published var state: State = .idle
     @Published var sheetVisible = false
@@ -130,6 +132,8 @@ final class Updater: ObservableObject {
     var isTrustedDownload: (URL) -> Bool = Updater.isTrustedGitHubURL
     var defaults = UserDefaults.standard
     var checkSigner: (URL) -> SignerTrust = Updater.signerTrust
+    /// The Ed25519 key updates must be signed with; nil only until signing has been set up (see UpdateKey).
+    var publicKey: Data? = UpdateKey.publicKey
     var relaunch: (_ script: URL, _ newApp: URL) -> Bool = Updater.launchHelper
     var quit: () -> Void = { NSApplication.shared.terminate(nil) }
 
@@ -188,7 +192,8 @@ final class Updater: ObservableObject {
         guard let zip = r.assets.first(where: { $0.name == assetName }) else { return nil }
         var v = r.tagName; if v.hasPrefix("v") || v.hasPrefix("V") { v.removeFirst() }
         return UpdateOffer(version: v, notes: r.body ?? "", pageURL: r.htmlUrl, zipURL: zip.browserDownloadUrl,
-                           sumsURL: r.assets.first(where: { $0.name == sumsName })?.browserDownloadUrl, size: zip.size)
+                           sumsURL: r.assets.first(where: { $0.name == sumsName })?.browserDownloadUrl, size: zip.size,
+                           sigURL: r.assets.first(where: { $0.name == sigName })?.browserDownloadUrl)
     }
 
     // MARK: Installing
@@ -232,6 +237,21 @@ final class Updater: ObservableObject {
         let actual = try await Task.detached { try ArchiveHasher.hash(file: zip).sha256 }.value
         guard actual == expected else {
             throw UpdateError.message("The download does not match its published SHA-256 checksum, so it was discarded.")
+        }
+
+        // The checksum only shows the zip is the one the release lists; whoever can edit the release can change both. The signature
+        // can only be made with the private key, which is not on GitHub's release page, so it proves the zip is ours.
+        if let key = publicKey {
+            guard let sigURL = offer.sigURL, isTrustedDownload(sigURL) else {
+                throw UpdateError.message("This release isn’t signed, so it was not installed. Download it from the release page instead.")
+            }
+            state = .working("Checking the signature…", nil)
+            let (sigData, _) = try await URLSession.shared.data(from: sigURL)
+            let sigText = String(decoding: sigData, as: UTF8.self)
+            let valid = await Task.detached { Self.verifySignature(zip: zip, signatureBase64: sigText, publicKey: key) }.value
+            guard valid else {
+                throw UpdateError.message("The update’s signature is not valid, so it was not installed. It does not come from the ArchiveX developer.")
+            }
         }
 
         state = .working("Unpacking…", nil)
@@ -320,6 +340,14 @@ final class Updater: ObservableObject {
             if name == file, hex.count == 64, hex.allSatisfy(\.isHexDigit) { return hex }
         }
         return nil
+    }
+
+    /// Whether `signatureBase64` is a valid Ed25519 signature of the whole zip under `publicKey`.
+    nonisolated static func verifySignature(zip: URL, signatureBase64: String, publicKey: Data) -> Bool {
+        guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: publicKey),
+              let sig = Data(base64Encoded: signatureBase64.trimmingCharacters(in: .whitespacesAndNewlines)), sig.count == 64,
+              let data = try? Data(contentsOf: zip, options: .mappedIfSafe) else { return false }
+        return key.isValidSignature(sig, for: data)
     }
 
     /// Whether `newApp` satisfies the designated requirement of the running app, i.e. comes from the same signer.

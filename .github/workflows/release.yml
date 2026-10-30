@@ -17,6 +17,11 @@ name: Release
 #   • Add ci_signing.pub to your GitHub account as a *signing* key so the tag shows "Verified":
 #       gh ssh-key add ci_signing.pub --type signing --title "ArchiveX CI signing"
 #
+# Signed updates (required): the zip is also signed with an Ed25519 key and published as ArchiveX.zip.sig. The app only installs
+# updates that verify against the public key in Sources/UpdateKey.swift. Run scripts/setup-update-signing.sh once to make the key,
+# store the private half as the repository secret UPDATE_SIGNING_KEY and write the public half into that file. A release stops
+# before publishing if this has not been done.
+#
 # Optional: if the repository has an Apple Developer ID configured (the secrets below), the app is also signed with it
 # and notarized by Apple, so macOS opens it without a warning. Without them the app is ad-hoc signed.
 #   MACOS_CERTIFICATE_P12       base64 of the "Developer ID Application" certificate exported as .p12
@@ -168,6 +173,21 @@ jobs:
           shasum -a 256 ArchiveX.zip > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Sign the update
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          # Every installed copy of ArchiveX only accepts an update signed with the key in Sources/UpdateKey.swift, so a release
+          # that is not signed with it would be refused everywhere. Stop here rather than publish one.
+          pub="$(sed -n 's/.*publicKeyBase64 = "\(.*\)".*/\1/p' Sources/UpdateKey.swift)"
+          if [ -z "$pub" ]; then
+            echo "Update signing is not set up. Run scripts/setup-update-signing.sh once, commit Sources/UpdateKey.swift, then release again."; exit 1
+          fi
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "The UPDATE_SIGNING_KEY secret is missing. Run scripts/setup-update-signing.sh."; exit 1
+          fi
+          UPDATE_PUBLIC_KEY="$pub" swift scripts/sign_update.swift ArchiveX.zip
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
@@ -180,5 +200,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$TAG" ArchiveX.zip SHA256SUMS \
+          gh release create "$TAG" ArchiveX.zip ArchiveX.zip.sig SHA256SUMS \
             --title "ArchiveX $TAG" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag

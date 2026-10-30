@@ -21,3 +21,8 @@ jobs:
             echo "non-system library linked"; exit 1
           fi
           echo "only system libraries are linked"
+      - name: Check the release scripts
+        run: |
+          sh -n scripts/setup-update-signing.sh
+          swiftc -typecheck scripts/generate_update_key.swift
+          swiftc -typecheck scripts/sign_update.swift
