@@ -45,8 +45,7 @@ struct ContentView: View {
         .quickLookPreview($model.quickLookURL)
         .onAppear {
             ArchiveModel.cleanOldScratch()
-            KeyEvents.install(model)
-            FinderActions.shared.attach(model)
+            KeyEvents.install()
             Updater.shared.checkOnLaunch()
         }
         .alert(item: $model.alert) { info in
@@ -474,9 +473,10 @@ enum Panels {
 enum KeyEvents {
     private static var monitor: Any?
 
-    static func install(_ model: ArchiveModel) {
+    static func install() {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard let model = ArchiveModel.active else { return event }
             guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
                   let w = NSApp.keyWindow, !(w is NSPanel), w.attachedSheet == nil,
                   !(w.firstResponder is NSTextView), !(w.firstResponder is NSTextField),

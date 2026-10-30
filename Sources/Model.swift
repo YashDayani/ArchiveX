@@ -92,6 +92,11 @@ struct ExtractDraft: Identifiable {
 
 @MainActor
 final class ArchiveModel: ObservableObject {
+    /// The model of the window that is key right now.
+    static weak var active: ArchiveModel?
+    /// Stands in for menu commands while no window is focused (everything is disabled then).
+    static let placeholder = ArchiveModel()
+
     @Published var archiveURL: URL?
     @Published var entries: [ArchiveEntry] = []
     @Published var details = ""

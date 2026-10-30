@@ -4,29 +4,68 @@ import UniformTypeIdentifiers
 @main
 struct ArchiveXApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var model = ArchiveModel()
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(model)
-                // Wide enough for all seven table columns next to the 300 pt inspector, and tall enough for the welcome screen.
-                .frame(minWidth: 1080, minHeight: 600)
-                .onOpenURL { url in
-                    if url.scheme == "archivex" { FinderActions.shared.handle(link: url) } else { model.open(url) }
-                }
+            WindowRoot()
         }
         .defaultSize(width: 1080, height: 640)
-        .commands { MenuCommands(model: model) }
+        .commands { MenuCommands() }
         Settings { SettingsView() }
+    }
+}
+
+/// One archive per window or tab: each gets its own model, so a new tab starts on the welcome screen.
+struct WindowRoot: View {
+    @StateObject private var model = ArchiveModel()
+
+    var body: some View {
+        ContentView()
+            .environmentObject(model)
+            .focusedSceneObject(model)
+            .background(WindowTracker(model: model))
+            // Wide enough for all seven table columns next to the 300 pt inspector, and tall enough for the welcome screen.
+            .frame(minWidth: 1080, minHeight: 600)
+            .onOpenURL { url in
+                if url.scheme == "archivex" { FinderActions.shared.handle(link: url) } else { model.open(url) }
+            }
+    }
+}
+
+/// Tells the app which window's model is the active one (key handling and Finder actions follow it).
+struct WindowTracker: NSViewRepresentable {
+    let model: ArchiveModel
+
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        let c = context.coordinator
+        DispatchQueue.main.async { [weak v] in
+            guard let w = v?.window else { return }
+            c.observe(w, model)
+        }
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    @MainActor final class Coordinator {
+        private var token: NSObjectProtocol?
+        func observe(_ window: NSWindow, _ model: ArchiveModel) {
+            if window.isKeyWindow { ArchiveModel.active = model; FinderActions.shared.attach(model) }
+            token = NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { _ in
+                MainActor.assumeIsolated { ArchiveModel.active = model; FinderActions.shared.attach(model) }
+            }
+        }
+        deinit { if let token { NotificationCenter.default.removeObserver(token) } }
     }
 }
 
 struct MenuCommands: Commands {
     @AppStorage(Updater.autoCheckKey) private var autoCheckUpdates = true
-    @ObservedObject var model: ArchiveModel
+    @FocusedObject private var focused: ArchiveModel?
 
     var body: some Commands {
+        let model = focused ?? ArchiveModel.placeholder
         CommandGroup(replacing: .appInfo) {
             Button("About ArchiveX") {
                 AboutPanel.show()
