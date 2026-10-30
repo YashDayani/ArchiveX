@@ -112,6 +112,49 @@ func check(_ n: String, _ ok: Bool, _ note: String = "") { if ok { pass += 1; pr
     let tpl = (try? String(contentsOfFile: "\(fm.currentDirectoryPath)/.github/ISSUE_TEMPLATE/bug_report.yml")) ?? ""
     if !tpl.isEmpty { check("every prefilled field exists in the issue form", ["id: version", "id: macos", "id: chip"].allSatisfy { tpl.contains($0) }) }
 
+    // 3h. recent archives on the welcome screen
+    let ra = URL(fileURLWithPath: "/x/a.zip"), rb = URL(fileURLWithPath: "/x/b.7z"), rc = URL(fileURLWithPath: "/y/c.rar"), rd = URL(fileURLWithPath: "/x/d.tar"), gone = URL(fileURLWithPath: "/x/gone.zip")
+    let recent = Recents.list(from: [ra, rb, ra, gone, rc, rd], limit: 3, exists: { $0 != gone }, size: { _ in 2048 })
+    check("recents keep order, drop duplicates and missing files, and stop at the limit", recent.map(\.url) == [ra, rb, rc], "\(recent.map(\.name))")
+    check("a recent shows its name, folder and size", recent[2].name == "c.rar" && recent[2].place == "y" && recent[2].size == Fmt.bytes(2048))
+    check("the welcome screen shows three recents at most", Recents.list(from: [ra, rb, rc, rd], exists: { _ in true }, size: { _ in 1 }).count == 3)
+
+    // 3j. inspector previews
+    check("preview kinds follow the file type", PreviewKind.of("a.PNG") == .image && PreviewKind.of("notes.md") == .text
+          && PreviewKind.of("x.pdf") == .pdf && PreviewKind.of("movie.mov") == .none && PreviewKind.of("noext") == .none)
+    let pv = dir.appendingPathComponent("pv")
+    try! fm.createDirectory(at: pv, withIntermediateDirectories: true)
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 20, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                               isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    try! rep.representation(using: .png, properties: [:])!.write(to: pv.appendingPathComponent("pic.png"))
+    try! "hello preview\n".write(to: pv.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+    try! Data([0, 1, 2, 3]).write(to: pv.appendingPathComponent("data.bin"))
+    do {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/zip"); p.arguments = ["-qr", "../pv.zip", "."]
+        p.currentDirectoryURL = pv; try! p.run(); p.waitUntilExit()
+    }
+    let m2 = ArchiveModel()
+    m2.open(dir.appendingPathComponent("pv.zip")); await settle(m2)
+    let loader = PreviewLoader()
+    func settled() async {
+        for _ in 0..<60 { if case .loading = loader.state { try? await Task.sleep(nanoseconds: 100_000_000) } else { break } }
+    }
+    let pic = m2.visibleRows.first { $0.name == "pic.png" }!, note = m2.visibleRows.first { $0.name == "note.txt" }!, bin = m2.visibleRows.first { $0.name == "data.bin" }!
+    loader.load(pic, in: m2); await settled()
+    if case .image(let img) = loader.state { check("an image in the archive is previewed", img.size.width == 40 && img.size.height == 20, "\(img.size)") }
+    else { check("an image in the archive is previewed", false, "\(loader.state)") }
+    loader.load(note, in: m2); await settled()
+    if case .text(let s, let cut) = loader.state { check("a text file is previewed", s == "hello preview\n" && !cut, s) }
+    else { check("a text file is previewed", false, "\(loader.state)") }
+    loader.load(bin, in: m2)
+    if case .none = loader.state { check("a file type without a preview shows none", true) } else { check("a file type without a preview shows none", false, "\(loader.state)") }
+    var big = pic; big.size = 50_000_000
+    loader.load(big, in: m2)
+    if case .notice(let n) = loader.state { check("a very large file is not unpacked for a preview", n.contains("Too large"), n) }
+    else { check("a very large file is not unpacked for a preview", false, "\(loader.state)") }
+    loader.load(nil, in: m2)
+    if case .none = loader.state { check("no selection clears the preview", true) } else { check("no selection clears the preview", false, "\(loader.state)") }
+
     // 4. leftovers: only the scratch root, which is wiped at the next launch
     ArchiveModel.cleanOldScratch()
     print("\nRESULT: \(pass) passed, \(fail) failed")

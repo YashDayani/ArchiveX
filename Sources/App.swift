@@ -10,12 +10,13 @@ struct ArchiveXApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                .frame(minWidth: 760, minHeight: 460)
+                // Wide enough for all seven table columns next to the 300 pt inspector, and tall enough for the welcome screen.
+                .frame(minWidth: 1080, minHeight: 600)
                 .onOpenURL { url in
                     if url.scheme == "archivex" { FinderActions.shared.handle(link: url) } else { model.open(url) }
                 }
         }
-        .defaultSize(width: 980, height: 600)
+        .defaultSize(width: 1080, height: 640)
         .commands { MenuCommands(model: model) }
         Settings { SettingsView() }
     }
@@ -75,7 +76,7 @@ struct MenuCommands: Commands {
             Button("Open Selected") { model.openSelected() }
                 .keyboardShortcut(.downArrow, modifiers: .command).disabled(model.selectedRows.count != 1)
             Divider()
-            Button("Get Info") { model.showArchiveInfo() }
+            Button(model.showInspector ? "Hide Inspector" : "Show Inspector") { model.showInspector.toggle() }
                 .keyboardShortcut("i").disabled(!model.hasArchive)
             Button("Calculate Checksums…") { model.calculateHashes() }
                 .keyboardShortcut("k", modifiers: [.command, .shift]).disabled(!model.hasArchive)

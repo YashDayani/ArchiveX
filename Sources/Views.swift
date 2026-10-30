@@ -11,25 +11,33 @@ struct ContentView: View {
         VStack(spacing: 0) {
             ButtonBar()
             Divider()
-            ZStack {
-                if model.hasArchive {
-                    VStack(spacing: 0) {
-                        PathBar()
-                        Divider()
-                        FileTable()
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    ZStack {
+                        if model.hasArchive {
+                            VStack(spacing: 0) {
+                                PathBar()
+                                Divider()
+                                FileTable()
+                            }
+                            // Subtle tint, confined to the file list, while something is dragged over it.
+                            Rectangle()
+                                .fill(Color.accentColor.opacity(dropTargeted ? 0.08 : 0))
+                                .allowsHitTesting(false)
+                                .animation(.easeOut(duration: 0.15), value: dropTargeted)
+                        } else {
+                            WelcomeView(targeted: dropTargeted)
+                        }
                     }
-                    // Subtle tint, confined to the file list, while something is dragged over it.
-                    Rectangle()
-                        .fill(Color.accentColor.opacity(dropTargeted ? 0.08 : 0))
-                        .allowsHitTesting(false)
-                        .animation(.easeOut(duration: 0.15), value: dropTargeted)
-                } else {
-                    WelcomeView(targeted: dropTargeted)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Divider()
+                    StatusBar()
+                }
+                if model.hasArchive && model.showInspector {
+                    Divider()
+                    InspectorPanel().frame(width: 300)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            Divider()
-            StatusBar()
         }
         .navigationTitle(model.title)
         .overlay { if model.busy { BusyOverlay() } }
@@ -52,7 +60,6 @@ struct ContentView: View {
         .sheet(item: $model.addDraft) { AddSheet(draft: $0) }
         .sheet(item: $model.extractDraft) { ExtractSheet(draft: $0) }
         .sheet(isPresented: $model.passwordPrompt) { PasswordSheet() }
-        .sheet(item: $model.archiveInfo) { InfoSheet(info: $0) }
         .sheet(isPresented: $updater.sheetVisible) { UpdateSheet() }
         .sheet(isPresented: Binding(get: { model.hashResults != nil }, set: { if !$0 { model.hashResults = nil } })) {
             if let results = model.hashResults { HashSheet(results: results) }
@@ -94,7 +101,7 @@ struct ButtonBar: View {
             BarButton("Add", "plus.rectangle.on.folder", enabled: model.hasArchive) { Panels.addToOpen(model) }
             BarButton("Extract To", "arrow.down.doc", enabled: model.hasArchive) { model.prepareExtract() }
             BarButton("Test", "checkmark.shield", enabled: model.hasArchive) { model.test() }
-            BarButton("Info", "info.circle", enabled: model.hasArchive) { model.showArchiveInfo() }
+            BarButton("Inspector", "sidebar.trailing", enabled: model.hasArchive) { model.showInspector.toggle() }
             BarButton("Hashes", "number.square", enabled: model.hasArchive) { model.calculateHashes() }
             BarButton("Quick Look", "eye.circle", enabled: model.selectedRows.contains { !$0.isDir }) {
                 model.quickLookSelected()
@@ -222,19 +229,19 @@ struct FileTable: View {
                 .accessibilityElement(children: .combine)
                 .contentShape(Rectangle())
                 .onDrag { model.fileProvider(for: r) }
-            }.width(min: 180, ideal: 300)
+            }.width(min: 150, ideal: 190)
             TableColumn("Size", value: \.size) { Text($0.sizeText).monospacedDigit() }
-                .width(min: 70, ideal: 90)
+                .width(min: 60, ideal: 70)
             TableColumn("Packed", value: \.packed) { Text($0.packedText).monospacedDigit() }
-                .width(min: 70, ideal: 90)
+                .width(min: 60, ideal: 70)
             TableColumn("Ratio", value: \.ratio) { Text($0.ratio).monospacedDigit() }
-                .width(min: 50, ideal: 60)
+                .width(min: 45, ideal: 50)
             TableColumn("Type", value: \.kind) { Text($0.kind) }
-                .width(min: 80, ideal: 110)
+                .width(min: 70, ideal: 80)
             TableColumn("Modified", value: \.mtime) { Text($0.mtime).monospacedDigit() }
-                .width(min: 120, ideal: 140)
+                .width(min: 115, ideal: 125)
             TableColumn("CRC32", value: \.crc) { Text($0.crc).font(.system(.body, design: .monospaced)) }
-                .width(min: 70, ideal: 90)
+                .width(min: 60, ideal: 70)
         }
         // The standard Copy command (⌘C) copies the selected items while the table has focus; in a text field it still copies text.
         .onCopyCommand { model.copySelection(); return [] }
@@ -246,7 +253,7 @@ struct FileTable: View {
                     Divider()
                 }
                 Button("Calculate Checksums…") { model.calculateHashes() }
-                Button("Get Info (⌘I)") { model.showArchiveInfo() }
+                Button("Show in Inspector (⌘I)") { model.showInspector = true }
                 Button("Copy (⌘C)") { model.copySelection() }
                 Button("Extract Selected To…") { model.prepareExtract() }
                 Divider()
@@ -276,11 +283,33 @@ struct WelcomeView: View {
     @EnvironmentObject var model: ArchiveModel
     @Environment(\.colorScheme) private var scheme
     let targeted: Bool
-
-    private let formats = ["ZIP", "7z", "RAR", "TAR", "GZ", "BZ2", "XZ", "ISO", "CPIO"]
+    @State private var recents: [RecentArchive] = []
 
     var body: some View {
+        // Scrolls when the window is too short for everything, and stays centred when there is room.
+        GeometryReader { geo in
+            ScrollView(showsIndicators: false) {
+                content.frame(minHeight: geo.size.height)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.accentColor.opacity(targeted ? 0.10 : 0.0))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(targeted ? 1 : 0),      // only while dragging over
+                              style: StrokeStyle(lineWidth: 2.5, dash: [9, 7]))
+        )
+        .padding(24)
+        .animation(.spring(response: 0.3, dampingFraction: 0.75), value: targeted)
+        .onAppear { recents = Recents.current }
+    }
+
+    private var content: some View {
         VStack(spacing: 14) {
+            Spacer(minLength: 12)
             logo
                 .frame(width: 96, height: 96)
                 .scaleEffect(targeted ? 1.08 : 1)
@@ -298,30 +327,25 @@ struct WelcomeView: View {
             }
             .controlSize(.large)
             .padding(.top, 2)
-            HStack(spacing: 6) {
-                ForEach(formats, id: \.self) { f in
-                    Text(f)
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .padding(.horizontal, 7).padding(.vertical, 3)
-                        .background(Capsule().fill(Color.primary.opacity(0.07)))
+            if !recents.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Recent").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Clear") { NSDocumentController.shared.clearRecentDocuments(nil); recents = [] }
+                            .buttonStyle(.link).font(.caption)
+                    }
+                    VStack(spacing: 8) {
+                        ForEach(recents) { RecentCard(item: $0) }
+                    }
                 }
-                            }
-            .foregroundStyle(.secondary)
-            .padding(.top, 4)
+                .frame(maxWidth: 400)
+                .padding(.top, 20)
+            }
+            Spacer(minLength: 12)
         }
         .padding(.horizontal, 40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color.accentColor.opacity(targeted ? 0.10 : 0.0))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(Color.accentColor.opacity(targeted ? 1 : 0),      // only while dragging over
-                              style: StrokeStyle(lineWidth: 2.5, dash: [9, 7]))
-        )
-        .padding(24)
-        .animation(.spring(response: 0.3, dampingFraction: 0.75), value: targeted)
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder private var logo: some View {

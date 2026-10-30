@@ -111,7 +111,10 @@ final class ArchiveModel: ObservableObject {
     @Published var quickLookURL: URL?
     @Published var searchQuery = ""
     @Published var hashResults: [ArchiveHasher.Result]?
-    @Published var archiveInfo: ArchiveInfo?
+    /// The side panel with a preview and details (⌘I); remembered between launches, on by default.
+    @Published var showInspector = UserDefaults.standard.object(forKey: "showInspector") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showInspector, forKey: "showInspector") }
+    }
     @Published var archiveComment: String? = nil
     @Published var searchFieldFocused = false
 
@@ -384,6 +387,20 @@ final class ArchiveModel: ObservableObject {
         return d
     }
 
+    /// Unpacks one file for the inspector's preview without the busy overlay. The file lands in the same per-archive folder
+    /// Quick Look uses, so pressing Space afterwards is instant.
+    func extractForPreview(_ row: Row) async throws -> URL {
+        guard let url = archiveURL else { throw CancellationError() }
+        let dir = previewFolder(for: url)
+        let out = dir.appendingPathComponent(row.id)
+        if FileManager.default.fileExists(atPath: out.path) { return out }
+        let pw = password
+        try await Task.detached(priority: .utility) {
+            try AXCore.extract(url, selection: [(path: row.id, isDir: false)], to: dir, overwrite: .all, keepPaths: true, password: pw, progress: { _ in })
+        }.value
+        return out
+    }
+
     func quickLookSelected() {
         if quickLookURL != nil {
             quickLookURL = nil
@@ -471,8 +488,10 @@ final class ArchiveModel: ObservableObject {
         searchFieldFocused = true
     }
 
-    func showArchiveInfo() {
-        guard let url = archiveURL else { return }
+    func showArchiveInfo() { showInspector.toggle() }
+
+    func makeArchiveInfo() -> ArchiveInfo? {
+        guard let url = archiveURL else { return nil }
         let fs = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
         let files = entries.filter { !$0.isDir }.count
         let dirs = entries.filter { $0.isDir }.count
@@ -503,7 +522,7 @@ final class ArchiveModel: ObservableObject {
             formatStr = url.pathExtension.uppercased()
         }
 
-        self.archiveInfo = ArchiveInfo(
+        return ArchiveInfo(
             name: url.lastPathComponent,
             path: url.path,
             formatName: formatStr,
