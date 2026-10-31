@@ -434,6 +434,15 @@ enum Panels {
         if p.runModal() == .OK, !p.urls.isEmpty { model.prepareAdd(files: p.urls) }
     }
 
+    @MainActor static func joinSplit(_ model: ArchiveModel) {
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = false
+        p.canChooseDirectories = false
+        p.prompt = "Join"
+        p.message = "Choose the first part of a split archive (for example Photos.7z.001)"
+        if p.runModal() == .OK, let u = p.url { model.joinSplit(u) }
+    }
+
     @MainActor static func addToOpen(_ model: ArchiveModel) {
         let p = NSOpenPanel()
         p.allowsMultipleSelection = true

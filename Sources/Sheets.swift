@@ -7,10 +7,16 @@ struct AddSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State var draft: AddDraft
     @State private var tabsPass = 0
+    @State private var sourceBytes: Int64 = 0
 
     init(draft: AddDraft) { _draft = State(initialValue: draft) }
 
     private let levels = ["Store", "Fastest", "Fast", "Normal", "Good", "Best"]
+
+    /// The chosen volume size, or nil when the archive is not split.
+    private var volumeBytes: UInt64? {
+        draft.splitPreset == .custom ? UInt64(max(1, draft.customSplitMB)) * 1024 * 1024 : draft.splitPreset.bytes
+    }
 
     private var passwordsMatch: Bool { draft.password == draft.confirm }
     private var valid: Bool { !draft.archivePath.isEmpty && !draft.files.isEmpty && passwordsMatch }
@@ -45,6 +51,10 @@ struct AddSheet: View {
             .padding(16)
         }
         .frame(width: 540)
+        .task {
+            let files = draft.files
+            sourceBytes = await Task.detached { SplitPlan.totalSize(of: files) }.value      // for the part-count estimate
+        }
     }
 
     private var general: some View {
@@ -60,6 +70,7 @@ struct AddSheet: View {
             .onChange(of: draft.format) { f in
                 draft.archivePath = Self.swapExtension(draft.archivePath, to: f)
                 if !f.password { draft.password = ""; draft.confirm = "" }
+                if f == .rar { draft.splitPreset = .none }          // a plain byte split is not a real RAR volume set
             }
             if draft.format.level {
                 Picker("Compression", selection: $draft.level) {
@@ -71,7 +82,7 @@ struct AddSheet: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             if draft.format.solid { Toggle("Create solid archive (smaller, slower to edit)", isOn: $draft.solid) }
-            if !draft.updatingExisting {
+            if !draft.updatingExisting && draft.format != .rar {
                 Picker("Split volumes", selection: $draft.splitPreset) {
                     ForEach(SplitPreset.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -82,8 +93,10 @@ struct AddSheet: View {
                         Text("MB").foregroundStyle(.secondary)
                     }
                 }
-                if draft.splitPreset != .none {
-                    Text("Splits output into .001, .002, … volume parts.")
+                if let vol = volumeBytes {
+                    Text(SplitPlan.summary(totalBytes: sourceBytes, volumeBytes: vol))
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Parts are named .001, .002, … ArchiveX and 7-Zip open them; macOS Archive Utility can’t. Join them with File → Join Split Archive.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

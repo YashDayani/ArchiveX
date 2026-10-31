@@ -298,25 +298,52 @@ final class ArchiveModel: ObservableObject {
     // MARK: extract
 
     /// Archive name without its extension (handles .tar.gz and friends).
-    private func baseName(_ url: URL) -> String {
+    private func baseName(_ url: URL) -> String { Self.baseName(url) }
+    static func baseName(_ url: URL) -> String {
         let n = url.lastPathComponent
         for e in [".tar.gz", ".tar.bz2", ".tar.xz"] where n.lowercased().hasSuffix(e) { return String(n.dropLast(e.count)) }
-        return (n as NSString).deletingPathExtension
+        // a split part (“Photos.7z.001”) is named after the archive, not after the part
+        let stripped = n.range(of: #"\.\d{3}$"#, options: .regularExpression).map { String(n[..<$0.lowerBound]) } ?? n
+        return (stripped as NSString).deletingPathExtension
+    }
+
+    /// True when everything in the archive already sits inside one top-level folder, so extracting needs no wrapper folder.
+    static func hasSingleTopFolder(_ entries: [ArchiveEntry]) -> Bool {
+        let tops = Set(entries.compactMap { $0.path.split(separator: "/").first.map(String.init) })
+        guard tops.count == 1 else { return false }
+        let loose = entries.contains { !$0.path.contains("/") && !$0.isDir }          // a file at the top level, not a folder
+        return !loose && entries.contains { $0.path.contains("/") || $0.isDir }
+    }
+
+    /// Where the files go by default: a folder named after the archive next to it, unless the archive already holds a single
+    /// top-level folder (then the files go next to the archive and that folder is the new folder). No folder inside a folder.
+    static func smartDestination(archive: URL, entries: [ArchiveEntry], in folder: URL? = nil) -> URL {
+        let parent = folder ?? archive.deletingLastPathComponent()
+        return hasSingleTopFolder(entries) ? parent : parent.appendingPathComponent(baseName(archive))
     }
 
     func prepareExtract() {
         guard let url = archiveURL else { return }
-        let folder = url.deletingLastPathComponent().appendingPathComponent(baseName(url)).path
-        let saved = UserDefaults.standard.string(forKey: "lastExtractDir")
-        extractDraft = ExtractDraft(destination: saved.map { $0 + "/" + baseName(url) } ?? folder,
+        let saved = UserDefaults.standard.string(forKey: "lastExtractDir").map { URL(fileURLWithPath: $0) }
+        extractDraft = ExtractDraft(destination: Self.smartDestination(archive: url, entries: entries, in: saved).path,
                                     onlySelected: !selection.isEmpty,
                                     hasSelection: !selection.isEmpty)
     }
 
+    /// Joins the parts of a split archive (name.7z.001, .002, …) into one file next to them and shows it in Finder.
+    func joinSplit(_ firstPart: URL) {
+        Task { [weak self] in
+            guard let self else { return }
+            switch await self.run("Joining the parts…", { p in try AXCore.joinParts(firstPart, progress: p) }) {
+            case .success(let joined): NSWorkspace.shared.activateFileViewerSelecting([joined])
+            case .failure(let e): self.handle(e, title: "Couldn’t join the parts") { }
+            }
+        }
+    }
+
     func quickExtract(toSubfolder: Bool) {
         guard let url = archiveURL else { return }
-        let base = url.deletingLastPathComponent()
-        let dest = toSubfolder ? base.appendingPathComponent(baseName(url)) : base
+        let dest = toSubfolder ? Self.smartDestination(archive: url, entries: entries) : url.deletingLastPathComponent()
         extract(ExtractDraft(destination: dest.path, onlySelected: false, hasSelection: false))
     }
 
@@ -680,7 +707,7 @@ final class ArchiveModel: ObservableObject {
         let level = (d.format == .sevenZ || d.format == .rar) ? d.level : (d.level == 0 ? 0 : 6)
         let pw: String? = d.password.isEmpty || !d.format.password ? nil : d.password
         let files = d.files
-        let volSize: UInt64? = d.splitPreset == .custom ? (UInt64(max(1, d.customSplitMB)) * 1024 * 1024) : d.splitPreset.bytes
+        let volSize: UInt64? = d.format == .rar ? nil : d.splitPreset == .custom ? (UInt64(max(1, d.customSplitMB)) * 1024 * 1024) : d.splitPreset.bytes
         let trimmedComment = d.comment.trimmingCharacters(in: .whitespacesAndNewlines)
         let comment: String? = trimmedComment.isEmpty ? nil : trimmedComment
         Task {

@@ -155,6 +155,20 @@ func check(_ n: String, _ ok: Bool, _ note: String = "") { if ok { pass += 1; pr
     loader.load(nil, in: m2)
     if case .none = loader.state { check("no selection clears the preview", true) } else { check("no selection clears the preview", false, "\(loader.state)") }
 
+    // 3k. Smart Extract: where the files go
+    func ent(_ p: String, dir: Bool = false) -> ArchiveEntry { ArchiveEntry(path: p, isDir: dir, size: 1, packed: 1, ratio: "", mtime: "", crc: "", attrs: "", encrypted: false) }
+    let trip = URL(fileURLWithPath: "/tmp/Trip photos.zip")
+    check("loose files go into a folder named after the archive", ArchiveModel.smartDestination(archive: trip, entries: [ent("a.txt"), ent("b.txt")]).path == "/tmp/Trip photos")
+    check("one top-level folder gets no wrapper folder", ArchiveModel.smartDestination(archive: trip, entries: [ent("Trip", dir: true), ent("Trip/a.txt"), ent("Trip/b.txt")]).path == "/tmp")
+    check("two top-level folders get a wrapper folder", ArchiveModel.smartDestination(archive: trip, entries: [ent("a/x"), ent("b/y")]).path == "/tmp/Trip photos")
+    check("a folder plus a loose file gets a wrapper folder", ArchiveModel.smartDestination(archive: trip, entries: [ent("a/x"), ent("loose.txt")]).path == "/tmp/Trip photos")
+    check("the rule applies inside the folder used last time", ArchiveModel.smartDestination(archive: trip, entries: [ent("a.txt")], in: URL(fileURLWithPath: "/Users/me/Out")).path == "/Users/me/Out/Trip photos"
+          && ArchiveModel.smartDestination(archive: trip, entries: [ent("T/a.txt")], in: URL(fileURLWithPath: "/Users/me/Out")).path == "/Users/me/Out")
+    check("tar.gz loses both extensions", ArchiveModel.baseName(URL(fileURLWithPath: "/tmp/data.tar.gz")) == "data")
+    check("a split part is named after the archive, not the part", ArchiveModel.baseName(URL(fileURLWithPath: "/tmp/Photos.7z.001")) == "Photos"
+          && ArchiveModel.baseName(URL(fileURLWithPath: "/tmp/Photos.zip.002")) == "Photos")
+    check("an empty archive has no single top folder", !ArchiveModel.hasSingleTopFolder([]))
+
     // 4. leftovers: only the scratch root, which is wiped at the next launch
     ArchiveModel.cleanOldScratch()
     print("\nRESULT: \(pass) passed, \(fail) failed")

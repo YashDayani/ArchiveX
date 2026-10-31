@@ -203,6 +203,47 @@ do {
     check("stale split parts", false, "\(error)")
 }
 
+// Joining the parts of a split archive, and the part-count estimate.
+do {
+    check("part count rounds up", SplitPlan.maxParts(totalBytes: 25, volumeBytes: 10) == 3 && SplitPlan.maxParts(totalBytes: 20, volumeBytes: 10) == 2)
+    check("a small payload needs one part", SplitPlan.maxParts(totalBytes: 5, volumeBytes: 10) == 1 && SplitPlan.maxParts(totalBytes: 0, volumeBytes: 10) == 1)
+    check("the estimate says when nothing will be split", SplitPlan.summary(totalBytes: 5, volumeBytes: 10).contains("nothing will be split")
+          && SplitPlan.summary(totalBytes: 50, volumeBytes: 10).contains("at most 5 parts"))
+
+    let dir = work.appendingPathComponent("join"); try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    let src = dir.appendingPathComponent("src"); try fm.createDirectory(at: src, withIntermediateDirectories: true)
+    let payload = Data((0..<90_000).map { _ in UInt8.random(in: 0...255) })
+    try payload.write(to: src.appendingPathComponent("blob.bin"))
+    check("the size of a folder is the sum of its files", SplitPlan.totalSize(of: [src]) == 90_000)
+
+    var spec = AXCreate(format: .zip, output: dir.appendingPathComponent("set.zip"), items: [src], level: 0, password: nil, legacyZipCrypto: false, deleteAfter: false)
+    spec.splitVolumeSize = 16_384
+    try AXCore.create(spec, progress: { _ in })
+    let parts = (try fm.contentsOfDirectory(atPath: dir.path)).filter { $0.hasPrefix("set.zip.") }.sorted()
+    check("the split made several parts", parts.count >= 5, "\(parts)")
+
+    let joined = try AXCore.joinParts(dir.appendingPathComponent("set.zip.001"), progress: { _ in })
+    check("the joined file is named after the archive", joined.lastPathComponent == "set.zip")
+    let glued = try parts.reduce(into: Data()) { $0.append(try Data(contentsOf: dir.appendingPathComponent($1))) }
+    check("the joined file is the parts glued together", try Data(contentsOf: joined) == glued)
+    let listing = try AXCore.list(joined, password: nil)
+    check("the joined archive opens on its own", listing.entries.contains { $0.path.hasSuffix("blob.bin") })
+    let again = try AXCore.joinParts(dir.appendingPathComponent("set.zip.001"), progress: { _ in })
+    check("joining again never overwrites the first result", again.lastPathComponent == "set (joined).zip" && fm.fileExists(atPath: joined.path), again.lastPathComponent)
+
+    // a missing part in the middle must be refused
+    try fm.removeItem(at: dir.appendingPathComponent("set.zip.003"))
+    var refused = false
+    do { _ = try AXCore.joinParts(dir.appendingPathComponent("set.zip.001"), progress: { _ in }) } catch { refused = "\(error)".contains("missing") || error.localizedDescription.contains("missing") }
+    check("a set with a missing part is refused", refused)
+    var notSplit = false
+    do { _ = try AXCore.joinParts(joined, progress: { _ in }) } catch { notSplit = error.localizedDescription.contains("not a part") }
+    check("a file that is not a part is refused", notSplit)
+    check("no half-written file is left behind", !((try fm.contentsOfDirectory(atPath: dir.path)).contains { $0.hasSuffix(".axtmp") }))
+} catch {
+    check("joining split archives", false, "\(error)")
+}
+
 print("\nRESULT: \(pass) passed, \(fail) failed")
 exit(fail == 0 ? 0 : 1)
 
