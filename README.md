@@ -35,6 +35,21 @@
 - **Safe extraction.** Entries that try to escape the destination folder (`../`, absolute paths, symlink tricks) are
   skipped and reported. Archives are checksummed while they are read, so damage is detected instead of ignored.
 
+## Everything it can do
+
+**[FEATURES.md](FEATURES.md)** lists every feature and every keyboard shortcut in one place. In the app, open it from
+**Help → Features & Shortcuts**. A quick tour:
+
+| | |
+|---|---|
+| **Browse** | Recent archives, search with wildcards, sorting, windows and tabs, an inspector panel (⌘I) that previews images, text and PDFs |
+| **Extract** | One-click smart extract (no folder inside a folder), selected files only, drag files out, fast on big ZIPs, safe against `../` tricks |
+| **Create and edit** | 7z, ZIP, RAR, TAR; add and delete in place; AES-256 passwords; ZIP comments; split into `.001`, `.002` parts and join them back |
+| **Verify** | Test integrity, CRC-32 / MD5 / SHA-1 / SHA-256 checksums with a paste-to-verify field |
+| **Finder** | Right-click Compress, Extract and Test; Open With; drag in and out |
+| **While it works** | Time left, Dock percentage, a notification when a long job finishes, plain-language errors |
+| **Stay current** | Update check on launch, signed updates, Install & Restart |
+
 ## Formats
 
 | Format | Open · list · test · extract | Create | Add / delete files |

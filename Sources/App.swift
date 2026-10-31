@@ -74,6 +74,7 @@ struct MenuCommands: Commands {
         CommandGroup(replacing: .newItem) {
             Button("Open Archive…") { Panels.openArchive(model) }.keyboardShortcut("o")
             Button("New Archive…") { Panels.newArchive(model) }.keyboardShortcut("n")
+            Button("Join Split Archive…") { Panels.joinSplit(model) }
             Divider()
             Button("Close Archive") { model.close() }
                 .keyboardShortcut("w").disabled(!model.hasArchive)
@@ -84,6 +85,8 @@ struct MenuCommands: Commands {
             Button("Copy") { model.copySelection() }.keyboardShortcut("c").disabled(model.selection.isEmpty)
         }
         CommandGroup(replacing: .help) {
+            Button("Features & Shortcuts") { NSWorkspace.shared.open(Feedback.featuresPage) }
+            Divider()
             Button("Report a Bug…") { Feedback.open(.bug) }
             Button("Request a Feature…") { Feedback.open(.feature) }
             Divider()

@@ -41,5 +41,7 @@ enum Feedback {
     @MainActor static func open(_ kind: Kind) { NSWorkspace.shared.open(url(kind)) }
 
     static var issuesPage: URL { URL(string: "https://github.com/\(repo)/issues")! }
+    /// The page that lists everything ArchiveX can do, with the keyboard shortcuts.
+    static var featuresPage: URL { URL(string: "https://github.com/\(repo)/blob/main/FEATURES.md")! }
     static var repoPage: URL { URL(string: "https://github.com/\(repo)")! }
 }
